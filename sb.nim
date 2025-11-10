@@ -10,7 +10,7 @@ type
     authToken: string
 
 var config: Config
-let configFile = getConfigDir() / "silverbullet-cli" / "config.json"
+var configFile = getConfigDir() / "silverbullet-cli" / "config.json"
 
 proc loadConfig() =
   if fileExists(configFile):
@@ -31,15 +31,15 @@ proc saveConfig() =
 
 proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, body = ""): string =
   let url = config.serverUrl & endpoint
-
+  
   client.headers = newHttpHeaders({
     "X-Sync-Mode": "true",
     "Accept": "application/json"
   })
-
+  
   if config.authToken != "":
     client.headers["Authorization"] = "Bearer " & config.authToken
-
+  
   try:
     var response: Response
     case httpMethod
@@ -52,13 +52,13 @@ proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, b
       response = client.request(url, httpMethod = HttpDelete)
     else:
       raise newException(ValueError, "Unsupported HTTP method")
-
+    
     # Check status code
     if response.code != Http200 and response.code != Http201 and response.code != Http204:
       styledEcho(fgRed, "✗ HTTP Error: ", resetStyle, $response.code, " ", response.status)
       echo "Response body: ", response.body[0..min(response.body.len-1, 500)]
       quit(1)
-
+    
     return response.body
   except HttpRequestError as e:
     styledEcho(fgRed, "✗ HTTP Error: ", resetStyle, e.msg)
@@ -87,31 +87,33 @@ BEFEHLE:
   version                 Zeigt Version an
   help                    Zeigt diese Hilfe an
 
-OPTIONEN:
-  --server=<url>          Überschreibt konfigurierte Server-URL
-  --token=<token>         Überschreibt konfigurierten Auth-Token
+GLOBALE OPTIONEN:
+  --configfile=<pfad>     Verwendet alternative Konfigurationsdatei
 
 BEISPIELE:
-  sb config https://localhost
+  sb config http://localhost:3000
   sb list
-  sb get "index"
-  sb create "Neue Notiz" "# Bla"
-Today's topics..."
-  sb append "index" "- New item"
+  sb get index
+  sb create "Neue Notiz" "# Bla
+bla bla..."
+  sb append index "- Neuer Eintrag"
   sb search "TODO"
+  
+  # Mit alternativer Config
+  sb --configfile=/path/to/config.json list
 
 KONFIGURATION:
-  Die Konfiguration wird gespeichert in:
+  Die Konfiguration wird standardmäßig gespeichert in:
   $3
 """ % [AppName, Version, configFile]
 
 proc configureServer(url: string, token = "") =
   var serverUrl = url.strip(chars = {'/'})
-
+  
   # Add http:// if no scheme is provided
   if not serverUrl.startsWith("http://") and not serverUrl.startsWith("https://"):
     serverUrl = "http://" & serverUrl
-
+  
   config.serverUrl = serverUrl
   config.authToken = token
   saveConfig()
@@ -123,17 +125,18 @@ proc configureServer(url: string, token = "") =
 proc listPages() =
   let client = newHttpClient()
   defer: client.close()
-
+  
+  # SilverBullet uses /.fs endpoint to list files
   let response = makeRequest(client, HttpGet, "/.fs")
-
+  
   try:
     let data = parseJson(response)
-
+    
     echo "\n📄 Seiten in SilverBullet\n"
     echo "─".repeat(60)
-
+    
     var pages: seq[tuple[name: string, lastModified: int]] = @[]
-
+    
     # The response is an array of file objects
     for item in data:
       if item.kind == JObject:
@@ -142,11 +145,11 @@ proc listPages() =
           let pageName = name[0..^4]  # Remove .md extension
           let modified = item{"lastModified"}.getInt(0)
           pages.add((name: pageName, lastModified: modified))
-
+    
     # Sort by last modified (newest first)
-    pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int =
+    pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int = 
       cmp(b.lastModified, a.lastModified))
-
+    
     for i, page in pages:
       if page.lastModified > 0:
         let modTime = fromUnix(page.lastModified div 1000)
@@ -157,7 +160,7 @@ proc listPages() =
       else:
         stdout.styledWrite(fgCyan, $(i+1), ". ", resetStyle)
         stdout.styledWriteLine(fgWhite, page.name)
-
+    
     echo "─".repeat(60)
     echo "Gesamt: ", pages.len, " Seiten"
   except JsonParsingError as e:
@@ -169,7 +172,7 @@ proc listPages() =
 proc getPage(pageName: string) =
   let client = newHttpClient()
   defer: client.close()
-
+  
   let encodedName = encodeUrl(pageName)
   let content = makeRequest(client, HttpGet, "/.fs/" & encodedName & ".md")
   echo content
@@ -177,31 +180,31 @@ proc getPage(pageName: string) =
 proc createOrEditPage(pageName: string, content: string, isEdit = false) =
   let client = newHttpClient()
   defer: client.close()
-
+  
   let encodedName = encodeUrl(pageName)
   discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", content)
-
+  
   let action = if isEdit: "aktualisiert" else: "erstellt"
   styledEcho(fgGreen, "✓ ", resetStyle, "Seite '", pageName, "' ", action)
 
 proc appendToPage(pageName: string, content: string) =
   let client = newHttpClient()
   defer: client.close()
-
+  
   let encodedName = encodeUrl(pageName)
   # Get current content
   let currentContent = makeRequest(client, HttpGet, "/.fs/" & encodedName & ".md")
-
+  
   # Append new content
   let newContent = currentContent & "\n" & content
-
+  
   discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", newContent)
   styledEcho(fgGreen, "✓ ", resetStyle, "Text zu '", pageName, "' hinzugefügt")
 
 proc deletePage(pageName: string) =
   let client = newHttpClient()
   defer: client.close()
-
+  
   let encodedName = encodeUrl(pageName)
   discard makeRequest(client, HttpDelete, "/.fs/" & encodedName & ".md")
   styledEcho(fgRed, "✗ ", resetStyle, "Seite '", pageName, "' gelöscht")
@@ -209,36 +212,36 @@ proc deletePage(pageName: string) =
 proc searchPages(query: string) =
   let client = newHttpClient()
   defer: client.close()
-
+  
   let response = makeRequest(client, HttpGet, "/.fs")
   let data = parseJson(response)
-
+  
   echo "\n🔍 Suche nach: '", query, "'\n"
   echo "─".repeat(60)
-
+  
   var found = 0
   for item in data:
     if item.kind == JObject:
       let name = item["name"].getStr()
       if name.endsWith(".md"):
         let pageName = name[0..^4]
-
+        
         # Check if query matches page name first
         if query.toLowerAscii() in pageName.toLowerAscii():
           found.inc
           styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgYellow, "(im Titel)")
           continue
-
+        
         # Get page content and search in it
         try:
           # URL encode the filename properly
           let encodedName = name.replace(" ", "%20")
           let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
-
+          
           if query.toLowerAscii() in content.toLowerAscii():
             found.inc
             styledEcho(fgCyan, "• ", resetStyle, pageName)
-
+            
             # Show matching lines
             for line in content.splitLines():
               if query.toLowerAscii() in line.toLowerAscii():
@@ -249,22 +252,22 @@ proc searchPages(query: string) =
         except CatchableError:
           # Skip files that can't be read
           discard
-
+  
   echo "─".repeat(60)
   echo "Gefunden: ", found, " Seiten"
 
 proc showRecent(limit = 10) =
   let client = newHttpClient()
   defer: client.close()
-
+  
   let response = makeRequest(client, HttpGet, "/.fs")
   let data = parseJson(response)
-
+  
   echo "\n🕐 Kürzlich geänderte Seiten\n"
   echo "─".repeat(60)
-
+  
   var pages: seq[tuple[name: string, lastModified: int]] = @[]
-
+  
   for item in data:
     if item.kind == JObject:
       let name = item["name"].getStr()
@@ -272,10 +275,10 @@ proc showRecent(limit = 10) =
         let pageName = name[0..^4]
         let modified = item{"lastModified"}.getInt(0)
         pages.add((name: pageName, lastModified: modified))
-
-  pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int =
+  
+  pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int = 
     cmp(b.lastModified, a.lastModified))
-
+  
   for i in 0..<min(limit, pages.len):
     if pages[i].lastModified > 0:
       let modTime = fromUnix(pages[i].lastModified div 1000)
@@ -286,35 +289,44 @@ proc showRecent(limit = 10) =
     else:
       stdout.styledWrite(fgCyan, $(i+1), ". ", resetStyle)
       stdout.styledWriteLine(fgWhite, pages[i].name)
-
+  
   echo "─".repeat(60)
 
 proc main() =
-  loadConfig()
-
-  if paramCount() == 0:
-    showHelp()
-    return
-
   # Get all command line arguments manually
   var args: seq[string] = @[]
   for i in 1..paramCount():
     args.add(paramStr(i))
-
+  
+  # Check for --configfile parameter
+  var i = 0
+  while i < args.len:
+    if args[i].startsWith("--configfile="):
+      configFile = args[i][9..^1]
+      args.delete(i)
+    elif args[i] == "--configfile" and i + 1 < args.len:
+      configFile = args[i + 1]
+      args.delete(i)
+      args.delete(i)
+    else:
+      i.inc
+  
+  loadConfig()
+  
   if args.len == 0:
     showHelp()
     return
-
+  
   let command = args[0].toLowerAscii()
-
+  
   if command in ["help", "h"]:
     showHelp()
     return
-
+  
   if command in ["version", "v"]:
     echo AppName, " v", Version
     return
-
+  
   if command == "config":
     if args.len < 2:
       echo "Fehler: Server-URL erforderlich"
@@ -324,7 +336,7 @@ proc main() =
     let token = if args.len >= 3: args[2] else: ""
     configureServer(url, token)
     return
-
+  
   # For all other commands, check if server is configured
   if config.serverUrl == "":
     styledEcho(fgRed, "✗ ", resetStyle, "Keine Server-URL konfiguriert!")
@@ -334,17 +346,17 @@ proc main() =
     echo "  sb config http://localhost:3000"
     echo "  sb config https://your-server.com"
     quit(1)
-
+  
   case command
   of "list", "ls":
     listPages()
-
+  
   of "get", "show", "cat":
     if args.len < 2:
       echo "Fehler: Seitenname erforderlich"
       return
     getPage(args[1])
-
+  
   of "create", "new":
     if args.len < 3:
       echo "Fehler: Seitenname und Inhalt erforderlich"
@@ -353,7 +365,7 @@ proc main() =
     let pageName = args[1]
     let content = args[2..^1].join(" ")
     createOrEditPage(pageName, content)
-
+  
   of "edit", "update":
     if args.len < 3:
       echo "Fehler: Seitenname und Inhalt erforderlich"
@@ -361,7 +373,7 @@ proc main() =
     let pageName = args[1]
     let content = args[2..^1].join(" ")
     createOrEditPage(pageName, content, isEdit = true)
-
+  
   of "append", "add":
     if args.len < 3:
       echo "Fehler: Seitenname und Inhalt erforderlich"
@@ -369,22 +381,22 @@ proc main() =
     let pageName = args[1]
     let content = args[2..^1].join(" ")
     appendToPage(pageName, content)
-
+  
   of "delete", "rm", "del":
     if args.len < 2:
       echo "Fehler: Seitenname erforderlich"
       return
     deletePage(args[1])
-
+  
   of "search", "find":
     if args.len < 2:
       echo "Fehler: Suchbegriff erforderlich"
       return
     searchPages(args[1])
-
+  
   of "recent":
     showRecent()
-
+  
   else:
     echo "Unbekannter Befehl: ", command
     echo "Verwende 'sb help' für Hilfe"
