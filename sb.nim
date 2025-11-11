@@ -1,7 +1,7 @@
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm]
 
 const
-  Version = "1.0.0"
+  Version = "1.0.1"
   AppName = "SilverBullet CLI"
 
 type
@@ -94,10 +94,15 @@ BEISPIELE:
   sb config http://localhost:3000
   sb list
   sb get index
-  sb create "Neue Notiz" "# Bla
-bla bla..."
-  sb append index "- Neuer Eintrag"
+  sb create "Meeting Notes" "# Meeting
+Today's topics..."
+  sb append index "- New item"
   sb search "TODO"
+  
+  # Mit stdin/pipe
+  echo "# Test" | sb create "Test Page"
+  cat notes.txt | sb append "Daily Notes"
+  sb create "From Stdin" < input.txt
   
   # Mit alternativer Config
   sb --configfile=/path/to/config.json list
@@ -107,6 +112,14 @@ KONFIGURATION:
   $3
 """ % [AppName, Version, configFile]
 
+proc readFromStdin(): string =
+  var content = ""
+  var line: string
+  while stdin.readLine(line):
+    if content.len > 0:
+      content.add("\n")
+    content.add(line)
+  return content
 proc configureServer(url: string, token = "") =
   var serverUrl = url.strip(chars = {'/'})
   
@@ -282,7 +295,7 @@ proc showRecent(limit = 10) =
   for i in 0..<min(limit, pages.len):
     if pages[i].lastModified > 0:
       let modTime = fromUnix(pages[i].lastModified div 1000)
-      let timeStr = modTime.format("yyyy-MM-dd HH:mm:ss")
+      let timeStr = modTime.format("dd.MM.yyyy HH:mm:ss")
       stdout.styledWrite(fgCyan, $(i+1), ". ", resetStyle)
       stdout.styledWrite(fgWhite, pages[i].name, " ")
       stdout.styledWriteLine(fgYellow, "(", timeStr, ")")
@@ -302,7 +315,7 @@ proc main() =
   var i = 0
   while i < args.len:
     if args[i].startsWith("--configfile="):
-      configFile = args[i][9..^1]
+      configFile = args[i][13..^1]
       args.delete(i)
     elif args[i] == "--configfile" and i + 1 < args.len:
       configFile = args[i + 1]
@@ -358,28 +371,55 @@ proc main() =
     getPage(args[1])
   
   of "create", "new":
-    if args.len < 3:
-      echo "Fehler: Seitenname und Inhalt erforderlich"
-      echo "Verwendung: sb create <page> <text>"
+    if args.len < 2:
+      echo "Fehler: Seitenname erforderlich"
+      echo "Verwendung: sb create <page> [<text>]"
+      echo "Wenn kein Text angegeben wird, wird von stdin gelesen."
       return
     let pageName = args[1]
-    let content = args[2..^1].join(" ")
+    let content = if args.len >= 3:
+      args[2..^1].join(" ")
+    else:
+      readFromStdin()
+    
+    if content.len == 0:
+      echo "Fehler: Kein Inhalt angegeben (weder als Argument noch von stdin)"
+      return
+    
     createOrEditPage(pageName, content)
   
   of "edit", "update":
-    if args.len < 3:
-      echo "Fehler: Seitenname und Inhalt erforderlich"
+    if args.len < 2:
+      echo "Fehler: Seitenname erforderlich"
       return
     let pageName = args[1]
-    let content = args[2..^1].join(" ")
+    let content = if args.len >= 3:
+      args[2..^1].join(" ")
+    else:
+      readFromStdin()
+    
+    if content.len == 0:
+      echo "Fehler: Kein Inhalt angegeben (weder als Argument noch von stdin)"
+      return
+    
     createOrEditPage(pageName, content, isEdit = true)
   
   of "append", "add":
-    if args.len < 3:
-      echo "Fehler: Seitenname und Inhalt erforderlich"
+    if args.len < 2:
+      echo "Fehler: Seitenname erforderlich"
+      echo "Verwendung: sb append <page> [<text>]"
+      echo "Wenn kein Text angegeben wird, wird von stdin gelesen."
       return
     let pageName = args[1]
-    let content = args[2..^1].join(" ")
+    let content = if args.len >= 3:
+      args[2..^1].join(" ")
+    else:
+      readFromStdin()
+    
+    if content.len == 0:
+      echo "Fehler: Kein Inhalt angegeben (weder als Argument noch von stdin)"
+      return
+    
     appendToPage(pageName, content)
   
   of "delete", "rm", "del":
