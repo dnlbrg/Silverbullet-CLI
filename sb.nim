@@ -1,8 +1,15 @@
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm]
 
 const
-  Version = "1.0.1"
+  Version = "1.0.2"
   AppName = "SilverBullet CLI"
+  # System-Verzeichnisse die standardmäßig ausgeblendet werden
+  SystemPrefixes = [
+    "Library/",
+    "SETTINGS",
+    "PLUGS",
+    "_"  # Dateien die mit _ beginnen
+  ]
 
 type
   Config = object
@@ -12,6 +19,23 @@ type
 var config: Config
 var configFile = getConfigDir() / "silverbullet-cli" / "config.json"
 
+## Prüft ob eine Seite eine System-Seite ist
+proc isSystemPage(pageName: string): bool =
+  for prefix in SystemPrefixes:
+    if pageName.startsWith(prefix):
+      return true
+  return false
+
+## Formatiert eine Zahl mit führenden Nullen
+proc formatWithLeadingZeros(num: int, width: int): string =
+  let numStr = $num
+  let zerosNeeded = width - numStr.len
+  if zerosNeeded > 0:
+    return "0".repeat(zerosNeeded) & numStr
+  else:
+    return numStr
+
+## Lädt Konfiguration aus der JSON-Datei (falls vorhanden).
 proc loadConfig() =
   if fileExists(configFile):
     try:
@@ -21,6 +45,7 @@ proc loadConfig() =
     except:
       discard
 
+## Speichert die aktuelle Konfiguration (Server-URL, Token) als JSON-Datei.
 proc saveConfig() =
   createDir(parentDir(configFile))
   let data = %* {
@@ -29,6 +54,17 @@ proc saveConfig() =
   }
   writeFile(configFile, data.pretty())
 
+## Liest Text von der Standard-Eingabe (stdin) ein.
+proc readFromStdin(): string =
+  var content = ""
+  var line: string
+  while stdin.readLine(line):
+    if content.len > 0:
+      content.add("\n")
+    content.add(line)
+  return content
+
+## Führt eine HTTP-Anfrage aus (GET/PUT/DELETE)
 proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, body = ""): string =
   let url = config.serverUrl & endpoint
   
@@ -53,10 +89,10 @@ proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, b
     else:
       raise newException(ValueError, "Unsupported HTTP method")
     
-    # Check status code
     if response.code != Http200 and response.code != Http201 and response.code != Http204:
       styledEcho(fgRed, "✗ HTTP Error: ", resetStyle, $response.code, " ", response.status)
-      echo "Response body: ", response.body[0..min(response.body.len-1, 500)]
+      if response.body.len > 0:
+        echo "Response body: ", response.body[0..min(response.body.len-1, 500)]
       quit(1)
     
     return response.body
@@ -67,6 +103,7 @@ proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, b
     styledEcho(fgRed, "✗ Error: ", resetStyle, e.msg)
     quit(1)
 
+## Druckt die Hilfe
 proc showHelp() =
   echo """
 $1 v$2
@@ -89,15 +126,18 @@ BEFEHLE:
 
 GLOBALE OPTIONEN:
   --configfile=<pfad>     Verwendet alternative Konfigurationsdatei
+  --all, -a               Zeigt auch System-Seiten (Library/, SETTINGS, etc.)
 
 BEISPIELE:
   sb config http://localhost:3000
   sb list
+  sb list --all              # Zeigt auch System-Seiten
   sb get index
-  sb create "Meeting Notes" "# Meeting
-Today's topics..."
+  sb create "Meeting Notes" "# Meeting"
   sb append index "- New item"
   sb search "TODO"
+  sb recent
+  sb recent --all            # Zeigt auch System-Seiten
   
   # Mit stdin/pipe
   echo "# Test" | sb create "Test Page"
@@ -112,18 +152,10 @@ KONFIGURATION:
   $3
 """ % [AppName, Version, configFile]
 
-proc readFromStdin(): string =
-  var content = ""
-  var line: string
-  while stdin.readLine(line):
-    if content.len > 0:
-      content.add("\n")
-    content.add(line)
-  return content
+## Setzt/normalisiert die Server-URL und speichert den Token
 proc configureServer(url: string, token = "") =
   var serverUrl = url.strip(chars = {'/'})
   
-  # Add http:// if no scheme is provided
   if not serverUrl.startsWith("http://") and not serverUrl.startsWith("https://"):
     serverUrl = "http://" & serverUrl
   
@@ -135,11 +167,11 @@ proc configureServer(url: string, token = "") =
   if token != "":
     echo "Token: ********"
 
-proc listPages() =
+## Fragt die Dateiliste am Server ab und zeigt sie an
+proc listPages(showAll = false) =
   let client = newHttpClient()
   defer: client.close()
   
-  # SilverBullet uses /.fs endpoint to list files
   let response = makeRequest(client, HttpGet, "/.fs")
   
   try:
@@ -150,38 +182,46 @@ proc listPages() =
     
     var pages: seq[tuple[name: string, lastModified: int]] = @[]
     
-    # The response is an array of file objects
     for item in data:
       if item.kind == JObject:
         let name = item["name"].getStr()
         if name.endsWith(".md"):
-          let pageName = name[0..^4]  # Remove .md extension
-          let modified = item{"lastModified"}.getInt(0)
-          pages.add((name: pageName, lastModified: modified))
+          let pageName = name[0..^4]
+          # Filtere System-Seiten aus, außer --all wurde angegeben
+          if showAll or not isSystemPage(pageName):
+            let modified = item{"lastModified"}.getInt(0)
+            pages.add((name: pageName, lastModified: modified))
     
-    # Sort by last modified (newest first)
     pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int = 
       cmp(b.lastModified, a.lastModified))
     
+    let numWidth = max(2, ($pages.len).len)
+    
     for i, page in pages:
+      let numStr = formatWithLeadingZeros(i+1, numWidth)
       if page.lastModified > 0:
         let modTime = fromUnix(page.lastModified div 1000)
         let timeStr = modTime.format("dd.MM.yyyy HH:mm")
-        stdout.styledWrite(fgCyan, $(i+1), ". ", resetStyle)
+        stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
         stdout.styledWrite(fgWhite, page.name, " ")
         stdout.styledWriteLine(fgYellow, "(", timeStr, ")")
       else:
-        stdout.styledWrite(fgCyan, $(i+1), ". ", resetStyle)
+        stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
         stdout.styledWriteLine(fgWhite, page.name)
     
     echo "─".repeat(60)
-    echo "Gesamt: ", pages.len, " Seiten"
+    if showAll:
+      echo "Gesamt: ", pages.len, " Seiten (alle)"
+    else:
+      echo "Gesamt: ", pages.len, " Seiten (ohne System-Seiten, verwende --all um alle zu sehen)"
   except JsonParsingError as e:
     styledEcho(fgRed, "✗ JSON Parse Error: ", resetStyle, e.msg)
     echo "Server response (first 500 chars):"
-    echo response[0..min(response.len-1, 500)]
+    if response.len > 0:
+      echo response[0..min(response.len-1, 500)]
     quit(1)
 
+## Holt den Inhalt einer Seite und zeigt ihn an
 proc getPage(pageName: string) =
   let client = newHttpClient()
   defer: client.close()
@@ -190,6 +230,7 @@ proc getPage(pageName: string) =
   let content = makeRequest(client, HttpGet, "/.fs/" & encodedName & ".md")
   echo content
 
+## Erstellt oder überschreibt eine Seite
 proc createOrEditPage(pageName: string, content: string, isEdit = false) =
   let client = newHttpClient()
   defer: client.close()
@@ -200,20 +241,18 @@ proc createOrEditPage(pageName: string, content: string, isEdit = false) =
   let action = if isEdit: "aktualisiert" else: "erstellt"
   styledEcho(fgGreen, "✓ ", resetStyle, "Seite '", pageName, "' ", action)
 
+## Hängt Text an eine Seite an
 proc appendToPage(pageName: string, content: string) =
   let client = newHttpClient()
   defer: client.close()
   
   let encodedName = encodeUrl(pageName)
-  # Get current content
   let currentContent = makeRequest(client, HttpGet, "/.fs/" & encodedName & ".md")
-  
-  # Append new content
   let newContent = currentContent & "\n" & content
-  
   discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", newContent)
   styledEcho(fgGreen, "✓ ", resetStyle, "Text zu '", pageName, "' hinzugefügt")
 
+## Löscht eine Seite
 proc deletePage(pageName: string) =
   let client = newHttpClient()
   defer: client.close()
@@ -222,6 +261,7 @@ proc deletePage(pageName: string) =
   discard makeRequest(client, HttpDelete, "/.fs/" & encodedName & ".md")
   styledEcho(fgRed, "✗ ", resetStyle, "Seite '", pageName, "' gelöscht")
 
+## Durchsucht alle Seiten
 proc searchPages(query: string) =
   let client = newHttpClient()
   defer: client.close()
@@ -239,23 +279,19 @@ proc searchPages(query: string) =
       if name.endsWith(".md"):
         let pageName = name[0..^4]
         
-        # Check if query matches page name first
         if query.toLowerAscii() in pageName.toLowerAscii():
           found.inc
           styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgYellow, "(im Titel)")
           continue
         
-        # Get page content and search in it
         try:
-          # URL encode the filename properly
-          let encodedName = name.replace(" ", "%20")
+          let encodedName = encodeUrl(name)
           let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
           
           if query.toLowerAscii() in content.toLowerAscii():
             found.inc
             styledEcho(fgCyan, "• ", resetStyle, pageName)
             
-            # Show matching lines
             for line in content.splitLines():
               if query.toLowerAscii() in line.toLowerAscii():
                 let trimmed = line.strip()
@@ -263,13 +299,13 @@ proc searchPages(query: string) =
                   echo "  ", trimmed[0..min(trimmed.len-1, 80)]
                 break
         except CatchableError:
-          # Skip files that can't be read
           discard
   
   echo "─".repeat(60)
   echo "Gefunden: ", found, " Seiten"
 
-proc showRecent(limit = 10) =
+## Zeigt die zuletzt geänderten Seiten
+proc showRecent(limit = 10, showAll = false) =
   let client = newHttpClient()
   defer: client.close()
   
@@ -286,32 +322,42 @@ proc showRecent(limit = 10) =
       let name = item["name"].getStr()
       if name.endsWith(".md"):
         let pageName = name[0..^4]
-        let modified = item{"lastModified"}.getInt(0)
-        pages.add((name: pageName, lastModified: modified))
+        # Filtere System-Seiten aus, außer --all wurde angegeben
+        if showAll or not isSystemPage(pageName):
+          let modified = item{"lastModified"}.getInt(0)
+          pages.add((name: pageName, lastModified: modified))
   
   pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int = 
     cmp(b.lastModified, a.lastModified))
   
+  let numWidth = max(2, ($min(limit, pages.len)).len)
+  
   for i in 0..<min(limit, pages.len):
+    let numStr = formatWithLeadingZeros(i+1, numWidth)
     if pages[i].lastModified > 0:
       let modTime = fromUnix(pages[i].lastModified div 1000)
       let timeStr = modTime.format("dd.MM.yyyy HH:mm:ss")
-      stdout.styledWrite(fgCyan, $(i+1), ". ", resetStyle)
+      stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
       stdout.styledWrite(fgWhite, pages[i].name, " ")
       stdout.styledWriteLine(fgYellow, "(", timeStr, ")")
     else:
-      stdout.styledWrite(fgCyan, $(i+1), ". ", resetStyle)
+      stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
       stdout.styledWriteLine(fgWhite, pages[i].name)
   
   echo "─".repeat(60)
+  if showAll:
+    echo "Zeige ", min(limit, pages.len), " von ", pages.len, " Seiten (alle)"
+  else:
+    echo "Zeige ", min(limit, pages.len), " von ", pages.len, " Seiten (ohne System-Seiten, verwende --all um alle zu sehen)"
 
+## Hauptfunktion
 proc main() =
-  # Get all command line arguments manually
   var args: seq[string] = @[]
   for i in 1..paramCount():
     args.add(paramStr(i))
   
-  # Check for --configfile parameter
+  # Prüfe auf globale Flags
+  var showAll = false
   var i = 0
   while i < args.len:
     if args[i].startsWith("--configfile="):
@@ -320,6 +366,9 @@ proc main() =
     elif args[i] == "--configfile" and i + 1 < args.len:
       configFile = args[i + 1]
       args.delete(i)
+      args.delete(i)
+    elif args[i] == "--all" or args[i] == "-a":
+      showAll = true
       args.delete(i)
     else:
       i.inc
@@ -350,7 +399,6 @@ proc main() =
     configureServer(url, token)
     return
   
-  # For all other commands, check if server is configured
   if config.serverUrl == "":
     styledEcho(fgRed, "✗ ", resetStyle, "Keine Server-URL konfiguriert!")
     echo "Verwende: sb config <server-url>"
@@ -362,7 +410,7 @@ proc main() =
   
   case command
   of "list", "ls":
-    listPages()
+    listPages(showAll)
   
   of "get", "show", "cat":
     if args.len < 2:
@@ -374,7 +422,6 @@ proc main() =
     if args.len < 2:
       echo "Fehler: Seitenname erforderlich"
       echo "Verwendung: sb create <page> [<text>]"
-      echo "Wenn kein Text angegeben wird, wird von stdin gelesen."
       return
     let pageName = args[1]
     let content = if args.len >= 3:
@@ -383,7 +430,7 @@ proc main() =
       readFromStdin()
     
     if content.len == 0:
-      echo "Fehler: Kein Inhalt angegeben (weder als Argument noch von stdin)"
+      echo "Fehler: Kein Inhalt angegeben"
       return
     
     createOrEditPage(pageName, content)
@@ -399,7 +446,7 @@ proc main() =
       readFromStdin()
     
     if content.len == 0:
-      echo "Fehler: Kein Inhalt angegeben (weder als Argument noch von stdin)"
+      echo "Fehler: Kein Inhalt angegeben"
       return
     
     createOrEditPage(pageName, content, isEdit = true)
@@ -407,8 +454,6 @@ proc main() =
   of "append", "add":
     if args.len < 2:
       echo "Fehler: Seitenname erforderlich"
-      echo "Verwendung: sb append <page> [<text>]"
-      echo "Wenn kein Text angegeben wird, wird von stdin gelesen."
       return
     let pageName = args[1]
     let content = if args.len >= 3:
@@ -417,7 +462,7 @@ proc main() =
       readFromStdin()
     
     if content.len == 0:
-      echo "Fehler: Kein Inhalt angegeben (weder als Argument noch von stdin)"
+      echo "Fehler: Kein Inhalt angegeben"
       return
     
     appendToPage(pageName, content)
@@ -435,7 +480,7 @@ proc main() =
     searchPages(args[1])
   
   of "recent":
-    showRecent()
+    showRecent(10, showAll)
   
   else:
     echo "Unbekannter Befehl: ", command
