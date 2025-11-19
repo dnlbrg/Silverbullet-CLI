@@ -1,16 +1,7 @@
-# =============================================================
-# SilverBullet CLI (Nim)
-# -------------------------------------------------------------
-# Zweck:
-#   Ein kleines Kommandozeilen-Tool, um Seiten (Markdown-Dateien)
-#   auf einem SilverBullet-Server zu erstellen, abzurufen, zu
-#   bearbeiten, anzuhängen, zu löschen und zu durchsuchen.
-# =============================================================
-
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm]
 
 const
-  Version = "1.0.2"
+  Version = "1.0.5"
   AppName = "SilverBullet CLI"
   # System-Verzeichnisse die standardmäßig ausgeblendet werden
   SystemPrefixes = [
@@ -35,7 +26,6 @@ proc isSystemPage(pageName: string): bool =
       return true
   return false
 
-## Formatiert eine Zahl mit führenden Nullen
 ## Beispiel: formatWithLeadingZeros(9, 2) = "09"
 proc formatWithLeadingZeros(num: int, width: int): string =
   let numStr = $num
@@ -133,6 +123,8 @@ BEFEHLE:
   recent                  Zeigt kürzlich geänderte Seiten
   backup [verzeichnis]    Erstellt ein Backup aller Seiten
   restore <verzeichnis>   Stellt Seiten aus Backup wieder her
+  download <page> [datei] Lädt eine Seite in eine lokale Datei
+  upload <datei> <page>   Lädt eine lokale Datei als Seite hoch
   version                 Zeigt Version an
   help                    Zeigt diese Hilfe an
 
@@ -162,6 +154,12 @@ BEISPIELE:
   sb restore backup-20250119-143025           # Am Original-Ort wiederherstellen
   sb restore backup-20250119-143025 --to=Archiv  # Nach Archiv/* verschieben
   sb restore /pfad/zu/backup --to=Import      # Nach Import/* importieren
+  
+  # Download/Upload einzelner Seiten
+  sb download "Daily Notes"                   # Lädt nach "Daily Notes.md"
+  sb download "Daily Notes" notizen.md        # Lädt nach "notizen.md"
+  sb upload notizen.md "Daily Notes"          # Hochladen als "Daily Notes"
+  sb upload ~/docs/todo.md "TODO Liste"       # Von beliebigem Pfad
   
   # Mit stdin/pipe
   echo "# Test" | sb create "Test Page"
@@ -493,6 +491,60 @@ proc restorePages(sourceDir: string, targetPrefix = "") =
   if restored > 0:
     styledEcho(fgGreen, "✓ ", resetStyle, "Restore erfolgreich!")
 
+## Lädt eine Seite in eine lokale Datei herunter
+proc downloadPage(pageName: string, outputFile = "") =
+  let client = newHttpClient()
+  defer: client.close()
+  
+  echo "\n📥 Lade Seite herunter..."
+  
+  try:
+    # Hole Seiteninhalt
+    let encodedName = encodeUrl(pageName)
+    let content = makeRequest(client, HttpGet, "/.fs/" & encodedName & ".md")
+    
+    # Bestimme Ausgabedatei
+    let filename = if outputFile != "":
+      outputFile
+    else:
+      pageName & ".md"
+    
+    # Speichere Datei
+    writeFile(filename, content)
+    
+    styledEcho(fgGreen, "✓ ", resetStyle, "Heruntergeladen: ", pageName)
+    echo "Gespeichert als: ", filename
+    echo "Größe: ", content.len, " Bytes"
+  except CatchableError as e:
+    styledEcho(fgRed, "✗ ", resetStyle, "Fehler beim Download: ", e.msg)
+    quit(1)
+
+## Lädt eine lokale Datei als Seite hoch
+proc uploadPage(sourceFile: string, pageName: string) =
+  let client = newHttpClient()
+  defer: client.close()
+  
+  echo "\n📤 Lade Datei hoch..."
+  
+  if not fileExists(sourceFile):
+    styledEcho(fgRed, "✗ ", resetStyle, "Datei nicht gefunden: ", sourceFile)
+    quit(1)
+  
+  try:
+    # Lese Dateiinhalt
+    let content = readFile(sourceFile)
+    
+    # Hochladen
+    let encodedName = encodeUrl(pageName)
+    discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", content)
+    
+    styledEcho(fgGreen, "✓ ", resetStyle, "Hochgeladen: ", sourceFile)
+    echo "Als Seite: ", pageName
+    echo "Größe: ", content.len, " Bytes"
+  except CatchableError as e:
+    styledEcho(fgRed, "✗ ", resetStyle, "Fehler beim Upload: ", e.msg)
+    quit(1)
+
 ## Hauptfunktion
 proc main() =
   var args: seq[string] = @[]
@@ -643,6 +695,21 @@ proc main() =
       echo "Verwendung: sb restore <backup-verzeichnis> [--to=<ziel-präfix>]"
       return
     restorePages(args[1], targetPrefix)
+  
+  of "download", "dl":
+    if args.len < 2:
+      echo "Fehler: Seitenname erforderlich"
+      echo "Verwendung: sb download <page> [<ausgabedatei>]"
+      return
+    let outputFile = if args.len >= 3: args[2] else: ""
+    downloadPage(args[1], outputFile)
+  
+  of "upload", "ul":
+    if args.len < 3:
+      echo "Fehler: Quelldatei und Seitenname erforderlich"
+      echo "Verwendung: sb upload <datei> <page>"
+      return
+    uploadPage(args[1], args[2])
   
   else:
     echo "Unbekannter Befehl: ", command
