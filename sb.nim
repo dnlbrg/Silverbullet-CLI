@@ -1,7 +1,7 @@
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm]
 
 const
-  Version = "1.0.2"
+  Version = "1.0.3"
   AppName = "SilverBullet CLI"
   # System-Verzeichnisse die standardmäßig ausgeblendet werden
   SystemPrefixes = [
@@ -121,12 +121,14 @@ BEFEHLE:
   delete <page>           Löscht eine Seite
   search <query>          Durchsucht alle Seiten
   recent                  Zeigt kürzlich geänderte Seiten
+  backup [verzeichnis]    Erstellt ein Backup aller Seiten
   version                 Zeigt Version an
   help                    Zeigt diese Hilfe an
 
 GLOBALE OPTIONEN:
   --configfile=<pfad>     Verwendet alternative Konfigurationsdatei
   --all, -a               Zeigt auch System-Seiten (Library/, SETTINGS, etc.)
+  --full                  Bei backup: inkl. System-Seiten (Library, SETTINGS, PLUGS)
 
 BEISPIELE:
   sb config http://localhost:3000
@@ -138,6 +140,11 @@ BEISPIELE:
   sb search "TODO"
   sb recent
   sb recent --all            # Zeigt auch System-Seiten
+  
+  # Backup
+  sb backup                  # Backup nach ./backup-YYYYMMDD-HHMMSS/
+  sb backup /pfad/zu/backup  # Backup in spezifisches Verzeichnis
+  sb backup --full           # Inkl. System-Seiten
   
   # Mit stdin/pipe
   echo "# Test" | sb create "Test Page"
@@ -350,6 +357,67 @@ proc showRecent(limit = 10, showAll = false) =
   else:
     echo "Zeige ", min(limit, pages.len), " von ", pages.len, " Seiten (ohne System-Seiten, verwende --all um alle zu sehen)"
 
+## Erstellt ein Backup aller Seiten
+proc backupPages(targetDir = "", fullBackup = false) =
+  let client = newHttpClient()
+  defer: client.close()
+  
+  # Erstelle Backup-Verzeichnis mit Zeitstempel
+  let timestamp = now().format("ddMMyyyy-HHmmss")
+  let backupPath = if targetDir != "":
+    targetDir
+  else:
+    getCurrentDir() / "backup-" & timestamp
+  
+  echo "\n💾 Erstelle Backup..."
+  echo "Zielverzeichnis: ", backupPath
+  echo "─".repeat(60)
+  
+  # Erstelle Verzeichnis
+  createDir(backupPath)
+  
+  # Hole Dateiliste
+  let response = makeRequest(client, HttpGet, "/.fs")
+  let data = parseJson(response)
+  
+  var backedUp = 0
+  var skipped = 0
+  
+  for item in data:
+    if item.kind == JObject:
+      let name = item["name"].getStr()
+      if name.endsWith(".md"):
+        let pageName = name[0..^4]
+        
+        # Filtere System-Seiten aus, außer --full wurde angegeben
+        if not fullBackup and isSystemPage(pageName):
+          skipped.inc
+          continue
+        
+        try:
+          # Hole Seiteninhalt
+          let encodedName = encodeUrl(name)
+          let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
+          
+          # Erstelle Unterverzeichnisse falls nötig
+          let filePath = backupPath / name
+          let dir = parentDir(filePath)
+          if dir != "" and not dirExists(dir):
+            createDir(dir)
+          
+          # Speichere Datei
+          writeFile(filePath, content)
+          backedUp.inc
+          echo "✓ ", name
+        except CatchableError as e:
+          styledEcho(fgRed, "✗ ", resetStyle, name, " (", e.msg, ")")
+  
+  echo "─".repeat(60)
+  echo "Gesichert: ", backedUp, " Dateien"
+  if skipped > 0:
+    echo "Übersprungen: ", skipped, " System-Dateien (verwende --full für komplettes Backup)"
+  styledEcho(fgGreen, "✓ ", resetStyle, "Backup erfolgreich nach: ", backupPath)
+
 ## Hauptfunktion
 proc main() =
   var args: seq[string] = @[]
@@ -358,6 +426,7 @@ proc main() =
   
   # Prüfe auf globale Flags
   var showAll = false
+  var fullBackup = false
   var i = 0
   while i < args.len:
     if args[i].startsWith("--configfile="):
@@ -369,6 +438,9 @@ proc main() =
       args.delete(i)
     elif args[i] == "--all" or args[i] == "-a":
       showAll = true
+      args.delete(i)
+    elif args[i] == "--full":
+      fullBackup = true
       args.delete(i)
     else:
       i.inc
@@ -481,6 +553,10 @@ proc main() =
   
   of "recent":
     showRecent(10, showAll)
+  
+  of "backup":
+    let backupDir = if args.len >= 2: args[1] else: ""
+    backupPages(backupDir, fullBackup)
   
   else:
     echo "Unbekannter Befehl: ", command
