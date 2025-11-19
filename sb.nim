@@ -1,7 +1,16 @@
+# =============================================================
+# SilverBullet CLI (Nim)
+# -------------------------------------------------------------
+# Zweck:
+#   Ein kleines Kommandozeilen-Tool, um Seiten (Markdown-Dateien)
+#   auf einem SilverBullet-Server zu erstellen, abzurufen, zu
+#   bearbeiten, anzuhängen, zu löschen und zu durchsuchen.
+# =============================================================
+
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm]
 
 const
-  Version = "1.0.3"
+  Version = "1.0.2"
   AppName = "SilverBullet CLI"
   # System-Verzeichnisse die standardmäßig ausgeblendet werden
   SystemPrefixes = [
@@ -27,6 +36,7 @@ proc isSystemPage(pageName: string): bool =
   return false
 
 ## Formatiert eine Zahl mit führenden Nullen
+## Beispiel: formatWithLeadingZeros(9, 2) = "09"
 proc formatWithLeadingZeros(num: int, width: int): string =
   let numStr = $num
   let zerosNeeded = width - numStr.len
@@ -122,6 +132,7 @@ BEFEHLE:
   search <query>          Durchsucht alle Seiten
   recent                  Zeigt kürzlich geänderte Seiten
   backup [verzeichnis]    Erstellt ein Backup aller Seiten
+  restore <verzeichnis>   Stellt Seiten aus Backup wieder her
   version                 Zeigt Version an
   help                    Zeigt diese Hilfe an
 
@@ -129,6 +140,7 @@ GLOBALE OPTIONEN:
   --configfile=<pfad>     Verwendet alternative Konfigurationsdatei
   --all, -a               Zeigt auch System-Seiten (Library/, SETTINGS, etc.)
   --full                  Bei backup: inkl. System-Seiten (Library, SETTINGS, PLUGS)
+  --to=<pfad>             Bei restore: Ziel-Präfix für wiederhergestellte Dateien
 
 BEISPIELE:
   sb config http://localhost:3000
@@ -145,6 +157,11 @@ BEISPIELE:
   sb backup                  # Backup nach ./backup-YYYYMMDD-HHMMSS/
   sb backup /pfad/zu/backup  # Backup in spezifisches Verzeichnis
   sb backup --full           # Inkl. System-Seiten
+  
+  # Restore
+  sb restore backup-20250119-143025           # Am Original-Ort wiederherstellen
+  sb restore backup-20250119-143025 --to=Archiv  # Nach Archiv/* verschieben
+  sb restore /pfad/zu/backup --to=Import      # Nach Import/* importieren
   
   # Mit stdin/pipe
   echo "# Test" | sb create "Test Page"
@@ -363,7 +380,7 @@ proc backupPages(targetDir = "", fullBackup = false) =
   defer: client.close()
   
   # Erstelle Backup-Verzeichnis mit Zeitstempel
-  let timestamp = now().format("ddMMyyyy-HHmmss")
+  let timestamp = now().format("yyyyMMdd-HHmmss")
   let backupPath = if targetDir != "":
     targetDir
   else:
@@ -418,6 +435,64 @@ proc backupPages(targetDir = "", fullBackup = false) =
     echo "Übersprungen: ", skipped, " System-Dateien (verwende --full für komplettes Backup)"
   styledEcho(fgGreen, "✓ ", resetStyle, "Backup erfolgreich nach: ", backupPath)
 
+## Stellt Seiten aus einem Backup wieder her
+proc restorePages(sourceDir: string, targetPrefix = "") =
+  let client = newHttpClient()
+  defer: client.close()
+  
+  if not dirExists(sourceDir):
+    styledEcho(fgRed, "✗ ", resetStyle, "Backup-Verzeichnis nicht gefunden: ", sourceDir)
+    quit(1)
+  
+  echo "\n📦 Stelle Backup wieder her..."
+  echo "Quelle: ", sourceDir
+  if targetPrefix != "":
+    echo "Ziel-Präfix: ", targetPrefix, "/"
+  else:
+    echo "Ziel: Original-Pfade"
+  echo "─".repeat(60)
+  
+  var restored = 0
+  var failed = 0
+  
+  # Durchsuche rekursiv alle .md Dateien
+  for file in walkDirRec(sourceDir):
+    if file.endsWith(".md"):
+      try:
+        # Lese Dateiinhalt
+        let content = readFile(file)
+        
+        # Berechne relativen Pfad
+        let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
+        
+        # Entferne .md Endung für Seitennamen
+        var pageName = relPath[0..^4]
+        
+        # Normalisiere Pfad-Trenner zu /
+        pageName = pageName.replace("\\", "/")
+        
+        # Füge Ziel-Präfix hinzu falls angegeben
+        if targetPrefix != "":
+          pageName = targetPrefix & "/" & pageName
+        
+        # Hochladen
+        let encodedName = encodeUrl(pageName)
+        discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", content)
+        
+        restored.inc
+        echo "✓ ", pageName
+      except CatchableError as e:
+        failed.inc
+        let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
+        styledEcho(fgRed, "✗ ", resetStyle, relPath, " (", e.msg, ")")
+  
+  echo "─".repeat(60)
+  echo "Wiederhergestellt: ", restored, " Dateien"
+  if failed > 0:
+    echo "⚠ ", failed, " Dateien konnten nicht wiederhergestellt werden"
+  if restored > 0:
+    styledEcho(fgGreen, "✓ ", resetStyle, "Restore erfolgreich!")
+
 ## Hauptfunktion
 proc main() =
   var args: seq[string] = @[]
@@ -427,6 +502,7 @@ proc main() =
   # Prüfe auf globale Flags
   var showAll = false
   var fullBackup = false
+  var targetPrefix = ""
   var i = 0
   while i < args.len:
     if args[i].startsWith("--configfile="):
@@ -441,6 +517,9 @@ proc main() =
       args.delete(i)
     elif args[i] == "--full":
       fullBackup = true
+      args.delete(i)
+    elif args[i].startsWith("--to="):
+      targetPrefix = args[i][5..^1]
       args.delete(i)
     else:
       i.inc
@@ -557,6 +636,13 @@ proc main() =
   of "backup":
     let backupDir = if args.len >= 2: args[1] else: ""
     backupPages(backupDir, fullBackup)
+  
+  of "restore":
+    if args.len < 2:
+      echo "Fehler: Backup-Verzeichnis erforderlich"
+      echo "Verwendung: sb restore <backup-verzeichnis> [--to=<ziel-präfix>]"
+      return
+    restorePages(args[1], targetPrefix)
   
   else:
     echo "Unbekannter Befehl: ", command
