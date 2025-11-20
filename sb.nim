@@ -1,7 +1,7 @@
-import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm]
+import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re, sets, tables]
 
 const
-  Version = "1.0.5"
+  Version = "1.0.7"
   AppName = "SilverBullet CLI"
   # System-Verzeichnisse die standardmäßig ausgeblendet werden
   SystemPrefixes = [
@@ -26,7 +26,7 @@ proc isSystemPage(pageName: string): bool =
       return true
   return false
 
-## Beispiel: formatWithLeadingZeros(9, 2) = "09"
+## Formatiert eine Zahl mit führenden Nullen
 proc formatWithLeadingZeros(num: int, width: int): string =
   let numStr = $num
   let zerosNeeded = width - numStr.len
@@ -125,6 +125,7 @@ BEFEHLE:
   restore <verzeichnis>   Stellt Seiten aus Backup wieder her
   download <page> [datei] Lädt eine Seite in eine lokale Datei
   upload <datei> <page>   Lädt eine lokale Datei als Seite hoch
+  graph [format]          Zeigt Verlinkungen zwischen Seiten (text, dot)
   version                 Zeigt Version an
   help                    Zeigt diese Hilfe an
 
@@ -301,7 +302,7 @@ proc searchPages(query: string) =
       if name.endsWith(".md"):
         let pageName = name[0..^4]
         
-        if query.toLowerAscii() in pageName.toLowerAscii():
+        if query.toLower() in pageName.toLower():
           found.inc
           styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgYellow, "(im Titel)")
           continue
@@ -310,12 +311,12 @@ proc searchPages(query: string) =
           let encodedName = encodeUrl(name)
           let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
           
-          if query.toLowerAscii() in content.toLowerAscii():
+          if query.toLower() in content.toLower():
             found.inc
             styledEcho(fgCyan, "• ", resetStyle, pageName)
             
             for line in content.splitLines():
-              if query.toLowerAscii() in line.toLowerAscii():
+              if query.toLower() in line.toLower():
                 let trimmed = line.strip()
                 if trimmed.len > 0:
                   echo "  ", trimmed[0..min(trimmed.len-1, 80)]
@@ -545,6 +546,110 @@ proc uploadPage(sourceFile: string, pageName: string) =
     styledEcho(fgRed, "✗ ", resetStyle, "Fehler beim Upload: ", e.msg)
     quit(1)
 
+## Extrahiert Wiki-Links aus Markdown-Text
+proc extractLinks(content: string): seq[string] =
+  var links: seq[string] = @[]
+  # Regex für [[Link]] und [[Link|Text]] Syntax
+  let pattern = re"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]"
+  for match in content.findAll(pattern):
+    let linkText = match.replace("[[", "").replace("]]", "")
+    let linkName = linkText.split("|")[0].strip()
+    if linkName != "":
+      links.add(linkName)
+  return links
+
+## Erstellt einen Graph der Verlinkungen zwischen Seiten
+proc showGraph(format = "text", showAll = false) =
+  let client = newHttpClient()
+  defer: client.close()
+  
+  # Info-Ausgaben nur bei Text-Format
+  if format.toLower() == "text":
+    echo "\n🔗 Analysiere Verlinkungen..."
+    echo "─".repeat(60)
+  
+  # Hole alle Seiten
+  let response = makeRequest(client, HttpGet, "/.fs")
+  let data = parseJson(response)
+  
+  # Sammle alle Seiten und ihre Links
+  var graph: Table[string, seq[string]]
+  var allPages: HashSet[string]
+  
+  for item in data:
+    if item.kind == JObject:
+      let name = item["name"].getStr()
+      if name.endsWith(".md"):
+        let pageName = name[0..^4]
+        
+        # Filtere System-Seiten
+        if not showAll and isSystemPage(pageName):
+          continue
+        
+        allPages.incl(pageName)
+        
+        try:
+          let encodedName = encodeUrl(name)
+          let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
+          let links = extractLinks(content)
+          graph[pageName] = links
+        except:
+          graph[pageName] = @[]
+  
+  # Ausgabe je nach Format
+  case format.toLower()
+  of "dot", "graphviz":
+    # Graphviz DOT Format - nur den Graph ausgeben
+    echo "digraph Notes {"
+    echo "  rankdir=LR;"
+    echo "  node [shape=box, style=rounded];"
+    echo ""
+    for page, links in graph:
+      let safeFrom = page.replace("\"", "\\\"")
+      for link in links:
+        if link in allPages:
+          let safeTo = link.replace("\"", "\\\"")
+          echo "  \"", safeFrom, "\" -> \"", safeTo, "\";"
+    echo "}"
+    
+  else:
+    # Text-Ausgabe (Standard)
+    var totalLinks = 0
+    var isolatedPages: seq[string] = @[]
+    
+    for page in allPages:
+      let outgoing = if page in graph: graph[page].len else: 0
+      var incoming = 0
+      
+      for otherPage, links in graph:
+        if page in links:
+          incoming.inc
+      
+      if outgoing == 0 and incoming == 0:
+        isolatedPages.add(page)
+      elif outgoing > 0:
+        echo "\n📄 ", page
+        echo "  → ", outgoing, " ausgehende Links:"
+        if page in graph:
+          for link in graph[page]:
+            if link in allPages:
+              echo "    • ", link
+              totalLinks.inc
+            else:
+              echo "    • ", link, " (nicht vorhanden)"
+        if incoming > 0:
+          echo "  ← ", incoming, " eingehende Links"
+    
+    if isolatedPages.len > 0:
+      echo "\n🔷 Isolierte Seiten (keine Verlinkungen):"
+      for page in isolatedPages:
+        echo "  • ", page
+    
+    echo "\n─".repeat(60)
+    echo "Seiten: ", allPages.len
+    echo "Verbindungen: ", totalLinks
+    echo "Isoliert: ", isolatedPages.len
+
 ## Hauptfunktion
 proc main() =
   var args: seq[string] = @[]
@@ -582,7 +687,7 @@ proc main() =
     showHelp()
     return
   
-  let command = args[0].toLowerAscii()
+  let command = args[0].toLower()
   
   if command in ["help", "h"]:
     showHelp()
@@ -710,6 +815,10 @@ proc main() =
       echo "Verwendung: sb upload <datei> <page>"
       return
     uploadPage(args[1], args[2])
+  
+  of "graph":
+    let format = if args.len >= 2: args[1] else: "text"
+    showGraph(format, showAll)
   
   else:
     echo "Unbekannter Befehl: ", command
