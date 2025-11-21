@@ -302,7 +302,7 @@ proc searchPages(query: string) =
       if name.endsWith(".md"):
         let pageName = name[0..^4]
         
-        if query.toLowerAscii() in pageName.toLowerAscii():
+        if query.toLower() in pageName.toLower():
           found.inc
           styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgYellow, "(im Titel)")
           continue
@@ -311,12 +311,12 @@ proc searchPages(query: string) =
           let encodedName = encodeUrl(name)
           let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
           
-          if query.toLowerAscii() in content.toLowerAscii():
+          if query.toLower() in content.toLower():
             found.inc
             styledEcho(fgCyan, "• ", resetStyle, pageName)
             
             for line in content.splitLines():
-              if query.toLowerAscii() in line.toLowerAscii():
+              if query.toLower() in line.toLower():
                 let trimmed = line.strip()
                 if trimmed.len > 0:
                   echo "  ", trimmed[0..min(trimmed.len-1, 80)]
@@ -584,7 +584,7 @@ proc showGraph(format = "text", showAll = false) =
   defer: client.close()
   
   # Info-Ausgaben nur bei Text-Format
-  if format.toLowerAscii() == "text":
+  if format.toLower() == "text":
     echo "\n🔗 Analysiere Verlinkungen..."
     echo "─".repeat(60)
   
@@ -617,7 +617,7 @@ proc showGraph(format = "text", showAll = false) =
           graph[pageName] = @[]
   
   # Ausgabe je nach Format
-  case format.toLowerAscii()
+  case format.toLower()
   of "dot", "graphviz":
     # Graphviz DOT Format - nur den Graph ausgeben
     echo "digraph Notes {"
@@ -707,7 +707,7 @@ proc main() =
     showHelp()
     return
   
-  let command = args[0].toLowerAscii()
+  let command = args[0].toLower()
   
   if command in ["help", "h"]:
     showHelp()
