@@ -1,7 +1,16 @@
+# =============================================================
+# SilverBullet CLI (Nim)
+# -------------------------------------------------------------
+# Zweck:
+#   Ein kleines Kommandozeilen-Tool, um Seiten (Markdown-Dateien)
+#   auf einem SilverBullet-Server zu erstellen, abzurufen, zu
+#   bearbeiten, anzuhängen, zu löschen und zu durchsuchen.
+# =============================================================
+
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re, sets, tables]
 
 const
-  Version = "1.0.7"
+  Version = "1.0.2"
   AppName = "SilverBullet CLI"
   # System-Verzeichnisse die standardmäßig ausgeblendet werden
   SystemPrefixes = [
@@ -27,6 +36,7 @@ proc isSystemPage(pageName: string): bool =
   return false
 
 ## Formatiert eine Zahl mit führenden Nullen
+## Beispiel: formatWithLeadingZeros(9, 2) = "09"
 proc formatWithLeadingZeros(num: int, width: int): string =
   let numStr = $num
   let zerosNeeded = width - numStr.len
@@ -546,18 +556,68 @@ proc uploadPage(sourceFile: string, pageName: string) =
     styledEcho(fgRed, "✗ ", resetStyle, "Fehler beim Upload: ", e.msg)
     quit(1)
 
+
+
 ## Extrahiert Wiki-Links aus Markdown-Text
 proc extractLinks(content: string): seq[string] =
   var links: seq[string] = @[]
   # Regex für [[Link]] und [[Link|Text]] Syntax
+  # Verbesserte Unicode-Unterstützung für Emoji und Sonderzeichen
   let pattern = re"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]"
-  for match in content.findAll(pattern):
-    let linkText = match.replace("[[", "").replace("]]", "")
-    let linkName = linkText.split("|")[0].strip()
-    if linkName != "":
-      links.add(linkName)
+  
+  var pos = 0
+  while pos < content.len:
+    let match = content[pos..^1].find(pattern)
+    if match >= 0:
+      let startPos = pos + match
+      let endPos = content.find("]]", startPos)
+      if endPos >= 0:
+        let fullMatch = content[startPos..endPos+1]
+        # Extrahiere den Link-Text
+        let linkContent = fullMatch[2..^3]  # Entferne [[ und ]]
+        let linkName = if "|" in linkContent:
+          linkContent.split("|")[0].strip()
+        else:
+          linkContent.strip()
+        
+        if linkName != "":
+          links.add(linkName)
+        pos = endPos + 2
+      else:
+        break
+    else:
+      break
+  
   return links
 
+## Gibt Text durch einen Pager aus (wie less)
+proc usePager(content: string) =
+  when defined(windows):
+    # Unter Windows: more verwenden
+    let tmpFile = getTempDir() / "sb_output.txt"
+    writeFile(tmpFile, content)
+    discard execShellCmd("more < " & tmpFile)
+    removeFile(tmpFile)
+  else:
+    # Unter Linux/Mac: less verwenden (fallback: more, fallback: cat)
+    if findExe("less") != "":
+      let tmpFile = getTempDir() / "sb_output.txt"
+      writeFile(tmpFile, content)
+      discard execShellCmd("less " & tmpFile)
+      removeFile(tmpFile)
+    elif findExe("more") != "":
+      let tmpFile = getTempDir() / "sb_output.txt"
+      writeFile(tmpFile, content)
+      discard execShellCmd("more " & tmpFile)
+      removeFile(tmpFile)
+    else:
+      # Kein Pager verfügbar, direkt ausgeben
+      echo content
+
+## Prüft ob Ausgabe durch Pager geleitet werden soll
+proc shouldUsePager(lines: int): bool =
+  # Verwende Pager wenn mehr als 30 Zeilen
+  return lines > 30
 ## Erstellt einen Graph der Verlinkungen zwischen Seiten
 proc showGraph(format = "text", showAll = false) =
   let client = newHttpClient()
@@ -616,6 +676,7 @@ proc showGraph(format = "text", showAll = false) =
     # Text-Ausgabe (Standard)
     var totalLinks = 0
     var isolatedPages: seq[string] = @[]
+    var output = ""
     
     for page in allPages:
       let outgoing = if page in graph: graph[page].len else: 0
@@ -628,27 +689,34 @@ proc showGraph(format = "text", showAll = false) =
       if outgoing == 0 and incoming == 0:
         isolatedPages.add(page)
       elif outgoing > 0:
-        echo "\n📄 ", page
-        echo "  → ", outgoing, " ausgehende Links:"
+        output.add("\n📄 " & page & "\n")
+        output.add("  → " & $outgoing & " ausgehende Links:\n")
         if page in graph:
           for link in graph[page]:
             if link in allPages:
-              echo "    • ", link
+              output.add("    • " & link & "\n")
               totalLinks.inc
             else:
-              echo "    • ", link, " (nicht vorhanden)"
+              output.add("    • " & link & " (nicht vorhanden)\n")
         if incoming > 0:
-          echo "  ← ", incoming, " eingehende Links"
+          output.add("  ← " & $incoming & " eingehende Links\n")
     
     if isolatedPages.len > 0:
-      echo "\n🔷 Isolierte Seiten (keine Verlinkungen):"
+      output.add("\n🔷 Isolierte Seiten (keine Verlinkungen):\n")
       for page in isolatedPages:
-        echo "  • ", page
+        output.add("  • " & page & "\n")
     
-    echo "\n─".repeat(60)
-    echo "Seiten: ", allPages.len
-    echo "Verbindungen: ", totalLinks
-    echo "Isoliert: ", isolatedPages.len
+    output.add("\n" & "─".repeat(60) & "\n")
+    output.add("Seiten: " & $allPages.len & "\n")
+    output.add("Verbindungen: " & $totalLinks & "\n")
+    output.add("Isoliert: " & $isolatedPages.len & "\n")
+    
+    # Prüfe ob Pager verwendet werden soll
+    let lineCount = output.count("\n")
+    if shouldUsePager(lineCount):
+      usePager(output)
+    else:
+      echo output
 
 ## Hauptfunktion
 proc main() =
