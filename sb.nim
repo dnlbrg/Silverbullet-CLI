@@ -1,8 +1,7 @@
-
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re, sets, tables]
 
 const
-  Version = "1.0.8"
+  Version = "0.0.8"
   AppName = "SilverBullet CLI"
   # System-Verzeichnisse die standardmäßig ausgeblendet werden
   SystemPrefixes = [
@@ -28,7 +27,6 @@ proc isSystemPage(pageName: string): bool =
   return false
 
 ## Formatiert eine Zahl mit führenden Nullen
-## Beispiel: formatWithLeadingZeros(9, 2) = "09"
 proc formatWithLeadingZeros(num: int, width: int): string =
   let numStr = $num
   let zerosNeeded = width - numStr.len
@@ -149,7 +147,7 @@ BEISPIELE:
   sb recent --all            # Zeigt auch System-Seiten
   
   # Backup
-  sb backup                  # Backup nach ./backup-YYYYMMDD-HHMMSS/
+  sb backup                  # Backup nach ./backup-MMDDYYYY-HHMMSS/
   sb backup /pfad/zu/backup  # Backup in spezifisches Verzeichnis
   sb backup --full           # Inkl. System-Seiten
   
@@ -304,7 +302,7 @@ proc searchPages(query: string) =
       if name.endsWith(".md"):
         let pageName = name[0..^4]
         
-        if query.toLower() in pageName.toLower():
+        if query.toLowerAscii() in pageName.toLowerAscii():
           found.inc
           styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgYellow, "(im Titel)")
           continue
@@ -313,12 +311,12 @@ proc searchPages(query: string) =
           let encodedName = encodeUrl(name)
           let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
           
-          if query.toLower() in content.toLower():
+          if query.toLowerAscii() in content.toLowerAscii():
             found.inc
             styledEcho(fgCyan, "• ", resetStyle, pageName)
             
             for line in content.splitLines():
-              if query.toLower() in line.toLower():
+              if query.toLowerAscii() in line.toLowerAscii():
                 let trimmed = line.strip()
                 if trimmed.len > 0:
                   echo "  ", trimmed[0..min(trimmed.len-1, 80)]
@@ -381,7 +379,7 @@ proc backupPages(targetDir = "", fullBackup = false) =
   defer: client.close()
   
   # Erstelle Backup-Verzeichnis mit Zeitstempel
-  let timestamp = now().format("yyyyMMdd-HHmmss")
+  let timestamp = now().format("ddMMyyyy-HHmmss")
   let backupPath = if targetDir != "":
     targetDir
   else:
@@ -548,8 +546,6 @@ proc uploadPage(sourceFile: string, pageName: string) =
     styledEcho(fgRed, "✗ ", resetStyle, "Fehler beim Upload: ", e.msg)
     quit(1)
 
-
-
 ## Extrahiert Wiki-Links aus Markdown-Text
 proc extractLinks(content: string): seq[string] =
   var links: seq[string] = @[]
@@ -582,41 +578,13 @@ proc extractLinks(content: string): seq[string] =
   
   return links
 
-## Gibt Text durch einen Pager aus (wie less)
-proc usePager(content: string) =
-  when defined(windows):
-    # Unter Windows: more verwenden
-    let tmpFile = getTempDir() / "sb_output.txt"
-    writeFile(tmpFile, content)
-    discard execShellCmd("more < " & tmpFile)
-    removeFile(tmpFile)
-  else:
-    # Unter Linux/Mac: less verwenden (fallback: more, fallback: cat)
-    if findExe("less") != "":
-      let tmpFile = getTempDir() / "sb_output.txt"
-      writeFile(tmpFile, content)
-      discard execShellCmd("less " & tmpFile)
-      removeFile(tmpFile)
-    elif findExe("more") != "":
-      let tmpFile = getTempDir() / "sb_output.txt"
-      writeFile(tmpFile, content)
-      discard execShellCmd("more " & tmpFile)
-      removeFile(tmpFile)
-    else:
-      # Kein Pager verfügbar, direkt ausgeben
-      echo content
-
-## Prüft ob Ausgabe durch Pager geleitet werden soll
-proc shouldUsePager(lines: int): bool =
-  # Verwende Pager wenn mehr als 30 Zeilen
-  return lines > 30
 ## Erstellt einen Graph der Verlinkungen zwischen Seiten
 proc showGraph(format = "text", showAll = false) =
   let client = newHttpClient()
   defer: client.close()
   
   # Info-Ausgaben nur bei Text-Format
-  if format.toLower() == "text":
+  if format.toLowerAscii() == "text":
     echo "\n🔗 Analysiere Verlinkungen..."
     echo "─".repeat(60)
   
@@ -649,7 +617,7 @@ proc showGraph(format = "text", showAll = false) =
           graph[pageName] = @[]
   
   # Ausgabe je nach Format
-  case format.toLower()
+  case format.toLowerAscii()
   of "dot", "graphviz":
     # Graphviz DOT Format - nur den Graph ausgeben
     echo "digraph Notes {"
@@ -668,7 +636,6 @@ proc showGraph(format = "text", showAll = false) =
     # Text-Ausgabe (Standard)
     var totalLinks = 0
     var isolatedPages: seq[string] = @[]
-    var output = ""
     
     for page in allPages:
       let outgoing = if page in graph: graph[page].len else: 0
@@ -681,34 +648,27 @@ proc showGraph(format = "text", showAll = false) =
       if outgoing == 0 and incoming == 0:
         isolatedPages.add(page)
       elif outgoing > 0:
-        output.add("\n📄 " & page & "\n")
-        output.add("  → " & $outgoing & " ausgehende Links:\n")
+        echo "\n📄 ", page
+        echo "  → ", outgoing, " ausgehende Links:"
         if page in graph:
           for link in graph[page]:
             if link in allPages:
-              output.add("    • " & link & "\n")
+              echo "    • ", link
               totalLinks.inc
             else:
-              output.add("    • " & link & " (nicht vorhanden)\n")
+              echo "    • ", link, " (nicht vorhanden)"
         if incoming > 0:
-          output.add("  ← " & $incoming & " eingehende Links\n")
+          echo "  ← ", incoming, " eingehende Links"
     
     if isolatedPages.len > 0:
-      output.add("\n🔷 Isolierte Seiten (keine Verlinkungen):\n")
+      echo "\n🔷 Isolierte Seiten (keine Verlinkungen):"
       for page in isolatedPages:
-        output.add("  • " & page & "\n")
+        echo "  • ", page
     
-    output.add("\n" & "─".repeat(60) & "\n")
-    output.add("Seiten: " & $allPages.len & "\n")
-    output.add("Verbindungen: " & $totalLinks & "\n")
-    output.add("Isoliert: " & $isolatedPages.len & "\n")
-    
-    # Prüfe ob Pager verwendet werden soll
-    let lineCount = output.count("\n")
-    if shouldUsePager(lineCount):
-      usePager(output)
-    else:
-      echo output
+    echo "\n─".repeat(60)
+    echo "Seiten: ", allPages.len
+    echo "Verbindungen: ", totalLinks
+    echo "Isoliert: ", isolatedPages.len
 
 ## Hauptfunktion
 proc main() =
@@ -747,7 +707,7 @@ proc main() =
     showHelp()
     return
   
-  let command = args[0].toLower()
+  let command = args[0].toLowerAscii()
   
   if command in ["help", "h"]:
     showHelp()
