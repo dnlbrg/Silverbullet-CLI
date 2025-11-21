@@ -1,16 +1,8 @@
-# =============================================================
-# SilverBullet CLI (Nim)
-# -------------------------------------------------------------
-# Zweck:
-#   Ein kleines Kommandozeilen-Tool, um Seiten (Markdown-Dateien)
-#   auf einem SilverBullet-Server zu erstellen, abzurufen, zu
-#   bearbeiten, anzuhängen, zu löschen und zu durchsuchen.
-# =============================================================
 
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re, sets, tables]
 
 const
-  Version = "1.0.2"
+  Version = "1.0.8"
   AppName = "SilverBullet CLI"
   # System-Verzeichnisse die standardmäßig ausgeblendet werden
   SystemPrefixes = [
