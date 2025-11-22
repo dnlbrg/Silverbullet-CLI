@@ -264,14 +264,29 @@ proc createOrEditPage(pageName: string, content: string, isEdit = false) =
   let action = if isEdit: "aktualisiert" else: "erstellt"
   styledEcho(fgGreen, "✓ ", resetStyle, "Seite '", pageName, "' ", action)
 
-## Hängt Text an eine Seite an
+# Hängt Text an eine Seite an (KORRIGIERTE VERSION)
 proc appendToPage(pageName: string, content: string) =
   let client = newHttpClient()
   defer: client.close()
   
   let encodedName = encodeUrl(pageName)
+  
+  # Hole aktuellen Inhalt
   let currentContent = makeRequest(client, HttpGet, "/.fs/" & encodedName & ".md")
-  let newContent = currentContent & "\n" & content
+  
+  # Stelle sicher, dass wir mit einem Newline enden
+  var newContent = currentContent
+  if not currentContent.endsWith("\n"):
+    newContent.add("\n")
+  
+  # Füge neuen Inhalt hinzu
+  newContent.add(content)
+  
+  # Stelle sicher, dass der neue Inhalt auch mit einem Newline endet
+  if not newContent.endsWith("\n"):
+    newContent.add("\n")
+  
+  # Speichere zurück
   discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", newContent)
   styledEcho(fgGreen, "✓ ", resetStyle, "Text zu '", pageName, "' hinzugefügt")
 
