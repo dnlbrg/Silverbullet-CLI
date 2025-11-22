@@ -1,7 +1,7 @@
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re, sets, tables]
 
 const
-  Version = "0.0.8"
+  Version = "0.0.9"
   AppName = "SilverBullet CLI"
   # System-Verzeichnisse die standardmäßig ausgeblendet werden
   SystemPrefixes = [
@@ -10,6 +10,12 @@ const
     "PLUGS",
     "_"  # Dateien die mit _ beginnen
   ]
+  # Konstanten für bessere Wartbarkeit
+  DefaultRecentLimit = 10
+  MaxSnippetLength = 80
+  SeparatorLength = 40
+  HttpTimeoutMs = 30000  # 30 Sekunden
+  PageContentSeparator = "\n"
 
 type
   Config = object
@@ -26,14 +32,21 @@ proc isSystemPage(pageName: string): bool =
       return true
   return false
 
+## Helper: Prüft ob Seite angezeigt werden soll
+proc shouldIncludePage(pageName: string, showAll: bool): bool =
+  showAll or not isSystemPage(pageName)
+
+## Validiert Seitennamen auf gefährliche Zeichen
+proc validatePageName(name: string): bool =
+  not (name.contains("..") or name.contains("\0") or name.len == 0)
+
+## Helper: Erstellt Endpoint-URL für eine Seite
+proc getPageEndpoint(pageName: string): string =
+  "/.fs/" & encodeUrl(pageName) & ".md"
+
 ## Formatiert eine Zahl mit führenden Nullen
 proc formatWithLeadingZeros(num: int, width: int): string =
-  let numStr = $num
-  let zerosNeeded = width - numStr.len
-  if zerosNeeded > 0:
-    return "0".repeat(zerosNeeded) & numStr
-  else:
-    return numStr
+  ($num).align(width, '0')
 
 ## Lädt Konfiguration aus der JSON-Datei (falls vorhanden).
 proc loadConfig() =
@@ -42,7 +55,7 @@ proc loadConfig() =
       let data = parseFile(configFile)
       config.serverUrl = data{"serverUrl"}.getStr("")
       config.authToken = data{"authToken"}.getStr("")
-    except:
+    except CatchableError:
       discard
 
 ## Speichert die aktuelle Konfiguration (Server-URL, Token) als JSON-Datei.
@@ -64,10 +77,25 @@ proc readFromStdin(): string =
     content.add(line)
   return content
 
+## Zeigt Progress-Anzeige
+proc showProgress(current, total: int, label = "Fortschritt") =
+  if total == 0: return
+  let percent = (current * 100) div total
+  let barWidth = 30
+  let filled = (percent * barWidth) div 100
+  stdout.write("\r" & label & ": [")
+  stdout.write("=".repeat(filled))
+  stdout.write(" ".repeat(barWidth - filled))
+  stdout.write("] " & $percent & "% (" & $current & "/" & $total & ")")
+  stdout.flushFile()
+  if current == total:
+    echo ""  # Neue Zeile am Ende
+
 ## Führt eine HTTP-Anfrage aus (GET/PUT/DELETE)
 proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, body = ""): string =
   let url = config.serverUrl & endpoint
   
+  client.timeout = HttpTimeoutMs
   client.headers = newHttpHeaders({
     "X-Sync-Mode": "true",
     "Accept": "application/json"
@@ -98,6 +126,13 @@ proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, b
     return response.body
   except HttpRequestError as e:
     styledEcho(fgRed, "✗ HTTP Error: ", resetStyle, e.msg)
+    quit(1)
+  except OSError as e:
+    # OSError wird bei Timeouts geworfen
+    if "timeout" in e.msg.toLower():
+      styledEcho(fgRed, "✗ Timeout: ", resetStyle, "Server antwortet nicht (>30s)")
+    else:
+      styledEcho(fgRed, "✗ Netzwerkfehler: ", resetStyle, e.msg)
     quit(1)
   except Exception as e:
     styledEcho(fgRed, "✗ Error: ", resetStyle, e.msg)
@@ -133,6 +168,7 @@ GLOBALE OPTIONEN:
   --configfile=<pfad>     Verwendet alternative Konfigurationsdatei
   --all, -a               Zeigt auch System-Seiten (Library/, SETTINGS, etc.)
   --full                  Bei backup: inkl. System-Seiten (Library, SETTINGS, PLUGS)
+  --verbose, -v           Zeigt detaillierte Ausgaben (z.B. Dateinamen bei backup)
   --to=<pfad>             Bei restore: Ziel-Präfix für wiederhergestellte Dateien
 
 BEISPIELE:
@@ -201,7 +237,7 @@ proc listPages(showAll = false) =
     let data = parseJson(response)
     
     echo "\n📄 Seiten in SilverBullet\n"
-    echo "─".repeat(60)
+    echo "─".repeat(SeparatorLength)
     
     var pages: seq[tuple[name: string, lastModified: int]] = @[]
     
@@ -210,8 +246,7 @@ proc listPages(showAll = false) =
         let name = item["name"].getStr()
         if name.endsWith(".md"):
           let pageName = name[0..^4]
-          # Filtere System-Seiten aus, außer --all wurde angegeben
-          if showAll or not isSystemPage(pageName):
+          if shouldIncludePage(pageName, showAll):
             let modified = item{"lastModified"}.getInt(0)
             pages.add((name: pageName, lastModified: modified))
     
@@ -232,7 +267,7 @@ proc listPages(showAll = false) =
         stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
         stdout.styledWriteLine(fgWhite, page.name)
     
-    echo "─".repeat(60)
+    echo "─".repeat(SeparatorLength)
     if showAll:
       echo "Gesamt: ", pages.len, " Seiten (alle)"
     else:
@@ -246,57 +281,72 @@ proc listPages(showAll = false) =
 
 ## Holt den Inhalt einer Seite und zeigt ihn an
 proc getPage(pageName: string) =
+  if not validatePageName(pageName):
+    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    quit(1)
+  
   let client = newHttpClient()
   defer: client.close()
   
-  let encodedName = encodeUrl(pageName)
-  let content = makeRequest(client, HttpGet, "/.fs/" & encodedName & ".md")
+  let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
   echo content
 
 ## Erstellt oder überschreibt eine Seite
 proc createOrEditPage(pageName: string, content: string, isEdit = false) =
+  if not validatePageName(pageName):
+    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    quit(1)
+  
   let client = newHttpClient()
   defer: client.close()
   
-  let encodedName = encodeUrl(pageName)
-  discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", content)
+  discard makeRequest(client, HttpPut, getPageEndpoint(pageName), content)
   
   let action = if isEdit: "aktualisiert" else: "erstellt"
   styledEcho(fgGreen, "✓ ", resetStyle, "Seite '", pageName, "' ", action)
 
-# Hängt Text an eine Seite an (KORRIGIERTE VERSION)
+## Hängt Text an eine Seite an
 proc appendToPage(pageName: string, content: string) =
+  if not validatePageName(pageName):
+    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    quit(1)
+  
   let client = newHttpClient()
   defer: client.close()
   
-  let encodedName = encodeUrl(pageName)
+  # Versuche existierenden Inhalt zu holen
+  var currentContent = ""
+  try:
+    currentContent = makeRequest(client, HttpGet, getPageEndpoint(pageName))
+  except CatchableError:
+    # Seite existiert nicht - wird neu erstellt
+    styledEcho(fgYellow, "ℹ ", resetStyle, "Seite '", pageName, "' existiert nicht, wird erstellt")
   
-  # Hole aktuellen Inhalt
-  let currentContent = makeRequest(client, HttpGet, "/.fs/" & encodedName & ".md")
-  
-  # Stelle sicher, dass wir mit einem Newline enden
+  # Baue neuen Inhalt zusammen
   var newContent = currentContent
-  if not currentContent.endsWith("\n"):
-    newContent.add("\n")
+  if currentContent.len > 0 and not currentContent.endsWith("\n"):
+    newContent.add(PageContentSeparator)
   
-  # Füge neuen Inhalt hinzu
   newContent.add(content)
   
-  # Stelle sicher, dass der neue Inhalt auch mit einem Newline endet
+  # Stelle sicher dass Datei mit Newline endet
   if not newContent.endsWith("\n"):
     newContent.add("\n")
   
   # Speichere zurück
-  discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", newContent)
+  discard makeRequest(client, HttpPut, getPageEndpoint(pageName), newContent)
   styledEcho(fgGreen, "✓ ", resetStyle, "Text zu '", pageName, "' hinzugefügt")
 
 ## Löscht eine Seite
 proc deletePage(pageName: string) =
+  if not validatePageName(pageName):
+    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    quit(1)
+  
   let client = newHttpClient()
   defer: client.close()
   
-  let encodedName = encodeUrl(pageName)
-  discard makeRequest(client, HttpDelete, "/.fs/" & encodedName & ".md")
+  discard makeRequest(client, HttpDelete, getPageEndpoint(pageName))
   styledEcho(fgRed, "✗ ", resetStyle, "Seite '", pageName, "' gelöscht")
 
 ## Durchsucht alle Seiten
@@ -308,7 +358,7 @@ proc searchPages(query: string) =
   let data = parseJson(response)
   
   echo "\n🔍 Suche nach: '", query, "'\n"
-  echo "─".repeat(60)
+  echo "─".repeat(SeparatorLength)
   
   var found = 0
   for item in data:
@@ -323,8 +373,7 @@ proc searchPages(query: string) =
           continue
         
         try:
-          let encodedName = encodeUrl(name)
-          let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
+          let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
           
           if query.toLower() in content.toLower():
             found.inc
@@ -334,16 +383,17 @@ proc searchPages(query: string) =
               if query.toLower() in line.toLower():
                 let trimmed = line.strip()
                 if trimmed.len > 0:
-                  echo "  ", trimmed[0..min(trimmed.len-1, 80)]
+                  echo "  ", trimmed[0..min(trimmed.len-1, MaxSnippetLength)]
                 break
-        except CatchableError:
+        except HttpRequestError, OSError:
+          # Ignoriere Fehler bei einzelnen Seiten
           discard
   
-  echo "─".repeat(60)
+  echo "─".repeat(SeparatorLength)
   echo "Gefunden: ", found, " Seiten"
 
 ## Zeigt die zuletzt geänderten Seiten
-proc showRecent(limit = 10, showAll = false) =
+proc showRecent(limit = DefaultRecentLimit, showAll = false) =
   let client = newHttpClient()
   defer: client.close()
   
@@ -351,7 +401,7 @@ proc showRecent(limit = 10, showAll = false) =
   let data = parseJson(response)
   
   echo "\n🕐 Kürzlich geänderte Seiten\n"
-  echo "─".repeat(60)
+  echo "─".repeat(SeparatorLength)
   
   var pages: seq[tuple[name: string, lastModified: int]] = @[]
   
@@ -360,8 +410,7 @@ proc showRecent(limit = 10, showAll = false) =
       let name = item["name"].getStr()
       if name.endsWith(".md"):
         let pageName = name[0..^4]
-        # Filtere System-Seiten aus, außer --all wurde angegeben
-        if showAll or not isSystemPage(pageName):
+        if shouldIncludePage(pageName, showAll):
           let modified = item{"lastModified"}.getInt(0)
           pages.add((name: pageName, lastModified: modified))
   
@@ -382,14 +431,14 @@ proc showRecent(limit = 10, showAll = false) =
       stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
       stdout.styledWriteLine(fgWhite, pages[i].name)
   
-  echo "─".repeat(60)
+  echo "─".repeat(SeparatorLength)
   if showAll:
     echo "Zeige ", min(limit, pages.len), " von ", pages.len, " Seiten (alle)"
   else:
     echo "Zeige ", min(limit, pages.len), " von ", pages.len, " Seiten (ohne System-Seiten, verwende --all um alle zu sehen)"
 
 ## Erstellt ein Backup aller Seiten
-proc backupPages(targetDir = "", fullBackup = false) =
+proc backupPages(targetDir = "", fullBackup = false, verbose = false) =
   let client = newHttpClient()
   defer: client.close()
   
@@ -402,7 +451,7 @@ proc backupPages(targetDir = "", fullBackup = false) =
   
   echo "\n💾 Erstelle Backup..."
   echo "Zielverzeichnis: ", backupPath
-  echo "─".repeat(60)
+  echo "─".repeat(SeparatorLength)
   
   # Erstelle Verzeichnis
   createDir(backupPath)
@@ -410,6 +459,16 @@ proc backupPages(targetDir = "", fullBackup = false) =
   # Hole Dateiliste
   let response = makeRequest(client, HttpGet, "/.fs")
   let data = parseJson(response)
+  
+  # Zähle erst relevante Dateien
+  var totalFiles = 0
+  for item in data:
+    if item.kind == JObject:
+      let name = item["name"].getStr()
+      if name.endsWith(".md"):
+        let pageName = name[0..^4]
+        if fullBackup or not isSystemPage(pageName):
+          totalFiles.inc
   
   var backedUp = 0
   var skipped = 0
@@ -427,8 +486,7 @@ proc backupPages(targetDir = "", fullBackup = false) =
         
         try:
           # Hole Seiteninhalt
-          let encodedName = encodeUrl(name)
-          let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
+          let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
           
           # Erstelle Unterverzeichnisse falls nötig
           let filePath = backupPath / name
@@ -439,11 +497,18 @@ proc backupPages(targetDir = "", fullBackup = false) =
           # Speichere Datei
           writeFile(filePath, content)
           backedUp.inc
-          echo "✓ ", name
+          
+          # Zeige entweder Details oder Progress
+          if verbose:
+            echo "✓ ", name
+          else:
+            showProgress(backedUp, totalFiles, "Backup")
         except CatchableError as e:
+          if not verbose:
+            echo ""  # Neue Zeile vor Fehler bei Progress
           styledEcho(fgRed, "✗ ", resetStyle, name, " (", e.msg, ")")
   
-  echo "─".repeat(60)
+  echo "─".repeat(SeparatorLength)
   echo "Gesichert: ", backedUp, " Dateien"
   if skipped > 0:
     echo "Übersprungen: ", skipped, " System-Dateien (verwende --full für komplettes Backup)"
@@ -464,43 +529,48 @@ proc restorePages(sourceDir: string, targetPrefix = "") =
     echo "Ziel-Präfix: ", targetPrefix, "/"
   else:
     echo "Ziel: Original-Pfade"
-  echo "─".repeat(60)
+  echo "─".repeat(SeparatorLength)
   
+  # Zähle erst alle Dateien
+  var allFiles: seq[string] = @[]
+  for file in walkDirRec(sourceDir):
+    if file.endsWith(".md"):
+      allFiles.add(file)
+  
+  let totalFiles = allFiles.len
   var restored = 0
   var failed = 0
   
   # Durchsuche rekursiv alle .md Dateien
-  for file in walkDirRec(sourceDir):
-    if file.endsWith(".md"):
-      try:
-        # Lese Dateiinhalt
-        let content = readFile(file)
-        
-        # Berechne relativen Pfad
-        let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
-        
-        # Entferne .md Endung für Seitennamen
-        var pageName = relPath[0..^4]
-        
-        # Normalisiere Pfad-Trenner zu /
-        pageName = pageName.replace("\\", "/")
-        
-        # Füge Ziel-Präfix hinzu falls angegeben
-        if targetPrefix != "":
-          pageName = targetPrefix & "/" & pageName
-        
-        # Hochladen
-        let encodedName = encodeUrl(pageName)
-        discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", content)
-        
-        restored.inc
-        echo "✓ ", pageName
-      except CatchableError as e:
-        failed.inc
-        let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
-        styledEcho(fgRed, "✗ ", resetStyle, relPath, " (", e.msg, ")")
+  for file in allFiles:
+    try:
+      # Lese Dateiinhalt
+      let content = readFile(file)
+      
+      # Berechne relativen Pfad
+      let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
+      
+      # Entferne .md Endung für Seitennamen
+      var pageName = relPath[0..^4]
+      
+      # Normalisiere Pfad-Trenner zu /
+      pageName = pageName.replace("\\", "/")
+      
+      # Füge Ziel-Präfix hinzu falls angegeben
+      if targetPrefix != "":
+        pageName = targetPrefix & "/" & pageName
+      
+      # Hochladen
+      discard makeRequest(client, HttpPut, getPageEndpoint(pageName), content)
+      
+      restored.inc
+      showProgress(restored, totalFiles, "Restore")
+    except CatchableError as e:
+      failed.inc
+      let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
+      styledEcho(fgRed, "\n✗ ", resetStyle, relPath, " (", e.msg, ")")
   
-  echo "─".repeat(60)
+  echo "─".repeat(SeparatorLength)
   echo "Wiederhergestellt: ", restored, " Dateien"
   if failed > 0:
     echo "⚠ ", failed, " Dateien konnten nicht wiederhergestellt werden"
@@ -509,6 +579,10 @@ proc restorePages(sourceDir: string, targetPrefix = "") =
 
 ## Lädt eine Seite in eine lokale Datei herunter
 proc downloadPage(pageName: string, outputFile = "") =
+  if not validatePageName(pageName):
+    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    quit(1)
+  
   let client = newHttpClient()
   defer: client.close()
   
@@ -516,8 +590,7 @@ proc downloadPage(pageName: string, outputFile = "") =
   
   try:
     # Hole Seiteninhalt
-    let encodedName = encodeUrl(pageName)
-    let content = makeRequest(client, HttpGet, "/.fs/" & encodedName & ".md")
+    let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
     
     # Bestimme Ausgabedatei
     let filename = if outputFile != "":
@@ -537,6 +610,10 @@ proc downloadPage(pageName: string, outputFile = "") =
 
 ## Lädt eine lokale Datei als Seite hoch
 proc uploadPage(sourceFile: string, pageName: string) =
+  if not validatePageName(pageName):
+    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    quit(1)
+  
   let client = newHttpClient()
   defer: client.close()
   
@@ -551,8 +628,7 @@ proc uploadPage(sourceFile: string, pageName: string) =
     let content = readFile(sourceFile)
     
     # Hochladen
-    let encodedName = encodeUrl(pageName)
-    discard makeRequest(client, HttpPut, "/.fs/" & encodedName & ".md", content)
+    discard makeRequest(client, HttpPut, getPageEndpoint(pageName), content)
     
     styledEcho(fgGreen, "✓ ", resetStyle, "Hochgeladen: ", sourceFile)
     echo "Als Seite: ", pageName
@@ -601,7 +677,7 @@ proc showGraph(format = "text", showAll = false) =
   # Info-Ausgaben nur bei Text-Format
   if format.toLower() == "text":
     echo "\n🔗 Analysiere Verlinkungen..."
-    echo "─".repeat(60)
+    echo "─".repeat(SeparatorLength)
   
   # Hole alle Seiten
   let response = makeRequest(client, HttpGet, "/.fs")
@@ -618,17 +694,16 @@ proc showGraph(format = "text", showAll = false) =
         let pageName = name[0..^4]
         
         # Filtere System-Seiten
-        if not showAll and isSystemPage(pageName):
+        if not shouldIncludePage(pageName, showAll):
           continue
         
         allPages.incl(pageName)
         
         try:
-          let encodedName = encodeUrl(name)
-          let content = makeRequest(client, HttpGet, "/.fs/" & encodedName)
+          let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
           let links = extractLinks(content)
           graph[pageName] = links
-        except:
+        except HttpRequestError, OSError:
           graph[pageName] = @[]
   
   # Ausgabe je nach Format
@@ -680,7 +755,7 @@ proc showGraph(format = "text", showAll = false) =
       for page in isolatedPages:
         echo "  • ", page
     
-    echo "\n─".repeat(60)
+    echo "\n─".repeat(SeparatorLength)
     echo "Seiten: ", allPages.len
     echo "Verbindungen: ", totalLinks
     echo "Isoliert: ", isolatedPages.len
@@ -695,6 +770,7 @@ proc main() =
   var showAll = false
   var fullBackup = false
   var targetPrefix = ""
+  var verbose = false
   var i = 0
   while i < args.len:
     if args[i].startsWith("--configfile="):
@@ -709,6 +785,9 @@ proc main() =
       args.delete(i)
     elif args[i] == "--full":
       fullBackup = true
+      args.delete(i)
+    elif args[i] == "--verbose" or args[i] == "-v":
+      verbose = true
       args.delete(i)
     elif args[i].startsWith("--to="):
       targetPrefix = args[i][5..^1]
@@ -823,11 +902,11 @@ proc main() =
     searchPages(args[1])
   
   of "recent":
-    showRecent(10, showAll)
+    showRecent(DefaultRecentLimit, showAll)
   
   of "backup":
     let backupDir = if args.len >= 2: args[1] else: ""
-    backupPages(backupDir, fullBackup)
+    backupPages(backupDir, fullBackup, verbose)
   
   of "restore":
     if args.len < 2:
