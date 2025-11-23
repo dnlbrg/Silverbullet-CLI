@@ -1,7 +1,7 @@
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re, sets, tables]
 
 const
-  Version = "0.0.9"
+  Version = "0.1.0"
   AppName = "SilverBullet CLI"
   # System-Verzeichnisse die standardmäßig ausgeblendet werden
   SystemPrefixes = [
@@ -13,7 +13,7 @@ const
   # Konstanten für bessere Wartbarkeit
   DefaultRecentLimit = 10
   MaxSnippetLength = 80
-  SeparatorLength = 40
+  SeparatorLength = 60
   HttpTimeoutMs = 30000  # 30 Sekunden
   PageContentSeparator = "\n"
 
@@ -153,7 +153,7 @@ BEFEHLE:
   create <page> <text>    Erstellt eine neue Seite
   edit <page> <text>      Bearbeitet eine existierende Seite
   append <page> <text>    Fügt Text an eine Seite an
-  delete <page>           Löscht eine Seite
+  delete <page>           Löscht eine Seite (mit Bestätigung)
   search <query>          Durchsucht alle Seiten
   recent                  Zeigt kürzlich geänderte Seiten
   backup [verzeichnis]    Erstellt ein Backup aller Seiten
@@ -167,44 +167,24 @@ BEFEHLE:
 GLOBALE OPTIONEN:
   --configfile=<pfad>     Verwendet alternative Konfigurationsdatei
   --all, -a               Zeigt auch System-Seiten (Library/, SETTINGS, etc.)
-  --full                  Bei backup: inkl. System-Seiten (Library, SETTINGS, PLUGS)
-  --verbose, -v           Zeigt detaillierte Ausgaben (z.B. Dateinamen bei backup)
+  --full                  Bei backup/restore: inkl. System-Seiten
+  --verbose               Zeigt detaillierte Ausgaben bei backup/restore
+  --force, -f             Überspringt Bestätigungen (z.B. bei delete)
   --to=<pfad>             Bei restore: Ziel-Präfix für wiederhergestellte Dateien
 
 BEISPIELE:
   sb config http://localhost:3000
   sb list
-  sb list --all              # Zeigt auch System-Seiten
   sb get index
   sb create "Meeting Notes" "# Meeting"
   sb append index "- New item"
+  sb delete "Test Page"
+  sb delete "Test Page" -f
   sb search "TODO"
-  sb recent
-  sb recent --all            # Zeigt auch System-Seiten
-  
-  # Backup
-  sb backup                  # Backup nach ./backup-MMDDYYYY-HHMMSS/
-  sb backup /pfad/zu/backup  # Backup in spezifisches Verzeichnis
-  sb backup --full           # Inkl. System-Seiten
-  
-  # Restore
-  sb restore backup-20250119-143025           # Am Original-Ort wiederherstellen
-  sb restore backup-20250119-143025 --to=Archiv  # Nach Archiv/* verschieben
-  sb restore /pfad/zu/backup --to=Import      # Nach Import/* importieren
-  
-  # Download/Upload einzelner Seiten
-  sb download "Daily Notes"                   # Lädt nach "Daily Notes.md"
-  sb download "Daily Notes" notizen.md        # Lädt nach "notizen.md"
-  sb upload notizen.md "Daily Notes"          # Hochladen als "Daily Notes"
-  sb upload ~/docs/todo.md "TODO Liste"       # Von beliebigem Pfad
-  
-  # Mit stdin/pipe
-  echo "# Test" | sb create "Test Page"
-  cat notes.txt | sb append "Daily Notes"
-  sb create "From Stdin" < input.txt
-  
-  # Mit alternativer Config
-  sb --configfile=/path/to/config.json list
+  sb backup
+  sb backup --verbose
+  sb restore backup-23112025-143025
+  sb restore backup-23112025-143025 --verbose
 
 KONFIGURATION:
   Die Konfiguration wird standardmäßig gespeichert in:
@@ -337,11 +317,20 @@ proc appendToPage(pageName: string, content: string) =
   discard makeRequest(client, HttpPut, getPageEndpoint(pageName), newContent)
   styledEcho(fgGreen, "✓ ", resetStyle, "Text zu '", pageName, "' hinzugefügt")
 
-## Löscht eine Seite
-proc deletePage(pageName: string) =
+## Löscht eine Seite (mit optionaler Bestätigung)
+proc deletePage(pageName: string, force = false) =
   if not validatePageName(pageName):
     styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
     quit(1)
+  
+  # Frage nach Bestätigung, außer --force
+  if not force:
+    stdout.styledWrite(fgYellow, "⚠ ", resetStyle, "Seite '", pageName, "' wirklich löschen? (j/N): ")
+    stdout.flushFile()
+    let answer = stdin.readLine().toLower()
+    if answer != "j" and answer != "ja" and answer != "y" and answer != "yes":
+      echo "Abgebrochen."
+      return
   
   let client = newHttpClient()
   defer: client.close()
@@ -386,9 +375,8 @@ proc searchPages(query: string) =
                   echo "  ", trimmed[0..min(trimmed.len-1, MaxSnippetLength)]
                 break
         except HttpRequestError, OSError:
-          # Ignoriere Fehler bei einzelnen Seiten
           discard
-  
+
   echo "─".repeat(SeparatorLength)
   echo "Gefunden: ", found, " Seiten"
 
@@ -442,7 +430,6 @@ proc backupPages(targetDir = "", fullBackup = false, verbose = false) =
   let client = newHttpClient()
   defer: client.close()
   
-  # Erstelle Backup-Verzeichnis mit Zeitstempel
   let timestamp = now().format("ddMMyyyy-HHmmss")
   let backupPath = if targetDir != "":
     targetDir
@@ -453,14 +440,11 @@ proc backupPages(targetDir = "", fullBackup = false, verbose = false) =
   echo "Zielverzeichnis: ", backupPath
   echo "─".repeat(SeparatorLength)
   
-  # Erstelle Verzeichnis
   createDir(backupPath)
   
-  # Hole Dateiliste
   let response = makeRequest(client, HttpGet, "/.fs")
   let data = parseJson(response)
   
-  # Zähle erst relevante Dateien
   var totalFiles = 0
   for item in data:
     if item.kind == JObject:
@@ -479,33 +463,28 @@ proc backupPages(targetDir = "", fullBackup = false, verbose = false) =
       if name.endsWith(".md"):
         let pageName = name[0..^4]
         
-        # Filtere System-Seiten aus, außer --full wurde angegeben
         if not fullBackup and isSystemPage(pageName):
           skipped.inc
           continue
         
         try:
-          # Hole Seiteninhalt
           let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
           
-          # Erstelle Unterverzeichnisse falls nötig
           let filePath = backupPath / name
           let dir = parentDir(filePath)
           if dir != "" and not dirExists(dir):
             createDir(dir)
           
-          # Speichere Datei
           writeFile(filePath, content)
           backedUp.inc
           
-          # Zeige entweder Details oder Progress
           if verbose:
             echo "✓ ", name
           else:
             showProgress(backedUp, totalFiles, "Backup")
         except CatchableError as e:
           if not verbose:
-            echo ""  # Neue Zeile vor Fehler bei Progress
+            echo ""
           styledEcho(fgRed, "✗ ", resetStyle, name, " (", e.msg, ")")
   
   echo "─".repeat(SeparatorLength)
@@ -515,7 +494,7 @@ proc backupPages(targetDir = "", fullBackup = false, verbose = false) =
   styledEcho(fgGreen, "✓ ", resetStyle, "Backup erfolgreich nach: ", backupPath)
 
 ## Stellt Seiten aus einem Backup wieder her
-proc restorePages(sourceDir: string, targetPrefix = "") =
+proc restorePages(sourceDir: string, targetPrefix = "", verbose = false) =
   let client = newHttpClient()
   defer: client.close()
   
@@ -531,7 +510,6 @@ proc restorePages(sourceDir: string, targetPrefix = "") =
     echo "Ziel: Original-Pfade"
   echo "─".repeat(SeparatorLength)
   
-  # Zähle erst alle Dateien
   var allFiles: seq[string] = @[]
   for file in walkDirRec(sourceDir):
     if file.endsWith(".md"):
@@ -541,34 +519,33 @@ proc restorePages(sourceDir: string, targetPrefix = "") =
   var restored = 0
   var failed = 0
   
-  # Durchsuche rekursiv alle .md Dateien
   for file in allFiles:
     try:
-      # Lese Dateiinhalt
       let content = readFile(file)
       
-      # Berechne relativen Pfad
       let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
       
-      # Entferne .md Endung für Seitennamen
       var pageName = relPath[0..^4]
       
-      # Normalisiere Pfad-Trenner zu /
       pageName = pageName.replace("\\", "/")
       
-      # Füge Ziel-Präfix hinzu falls angegeben
       if targetPrefix != "":
         pageName = targetPrefix & "/" & pageName
       
-      # Hochladen
       discard makeRequest(client, HttpPut, getPageEndpoint(pageName), content)
       
       restored.inc
-      showProgress(restored, totalFiles, "Restore")
+      
+      if verbose:
+        echo "✓ ", pageName
+      else:
+        showProgress(restored, totalFiles, "Restore")
     except CatchableError as e:
       failed.inc
       let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
-      styledEcho(fgRed, "\n✗ ", resetStyle, relPath, " (", e.msg, ")")
+      if not verbose:
+        echo ""
+      styledEcho(fgRed, "✗ ", resetStyle, relPath, " (", e.msg, ")")
   
   echo "─".repeat(SeparatorLength)
   echo "Wiederhergestellt: ", restored, " Dateien"
@@ -589,16 +566,13 @@ proc downloadPage(pageName: string, outputFile = "") =
   echo "\n📥 Lade Seite herunter..."
   
   try:
-    # Hole Seiteninhalt
     let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
     
-    # Bestimme Ausgabedatei
     let filename = if outputFile != "":
       outputFile
     else:
       pageName & ".md"
     
-    # Speichere Datei
     writeFile(filename, content)
     
     styledEcho(fgGreen, "✓ ", resetStyle, "Heruntergeladen: ", pageName)
@@ -624,10 +598,8 @@ proc uploadPage(sourceFile: string, pageName: string) =
     quit(1)
   
   try:
-    # Lese Dateiinhalt
     let content = readFile(sourceFile)
     
-    # Hochladen
     discard makeRequest(client, HttpPut, getPageEndpoint(pageName), content)
     
     styledEcho(fgGreen, "✓ ", resetStyle, "Hochgeladen: ", sourceFile)
@@ -640,32 +612,17 @@ proc uploadPage(sourceFile: string, pageName: string) =
 ## Extrahiert Wiki-Links aus Markdown-Text
 proc extractLinks(content: string): seq[string] =
   var links: seq[string] = @[]
-  # Regex für [[Link]] und [[Link|Text]] Syntax
-  # Verbesserte Unicode-Unterstützung für Emoji und Sonderzeichen
   let pattern = re"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]"
   
-  var pos = 0
-  while pos < content.len:
-    let match = content[pos..^1].find(pattern)
-    if match >= 0:
-      let startPos = pos + match
-      let endPos = content.find("]]", startPos)
-      if endPos >= 0:
-        let fullMatch = content[startPos..endPos+1]
-        # Extrahiere den Link-Text
-        let linkContent = fullMatch[2..^3]  # Entferne [[ und ]]
-        let linkName = if "|" in linkContent:
-          linkContent.split("|")[0].strip()
-        else:
-          linkContent.strip()
-        
-        if linkName != "":
-          links.add(linkName)
-        pos = endPos + 2
-      else:
-        break
+  for match in content.findAll(pattern):
+    let inner = match[2..^3]
+    let linkName = if "|" in inner:
+      inner.split("|")[0].strip()
     else:
-      break
+      inner.strip()
+    
+    if linkName != "":
+      links.add(linkName)
   
   return links
 
@@ -674,18 +631,16 @@ proc showGraph(format = "text", showAll = false) =
   let client = newHttpClient()
   defer: client.close()
   
-  # Info-Ausgaben nur bei Text-Format
   if format.toLower() == "text":
     echo "\n🔗 Analysiere Verlinkungen..."
     echo "─".repeat(SeparatorLength)
   
-  # Hole alle Seiten
   let response = makeRequest(client, HttpGet, "/.fs")
   let data = parseJson(response)
   
-  # Sammle alle Seiten und ihre Links
   var graph: Table[string, seq[string]]
   var allPages: HashSet[string]
+  var incomingCounts: Table[string, int]
   
   for item in data:
     if item.kind == JObject:
@@ -693,23 +648,26 @@ proc showGraph(format = "text", showAll = false) =
       if name.endsWith(".md"):
         let pageName = name[0..^4]
         
-        # Filtere System-Seiten
         if not shouldIncludePage(pageName, showAll):
           continue
         
         allPages.incl(pageName)
+        incomingCounts[pageName] = 0
         
         try:
           let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
           let links = extractLinks(content)
           graph[pageName] = links
+          
+          for link in links:
+            if link notin incomingCounts:
+              incomingCounts[link] = 0
+            incomingCounts[link] += 1
         except HttpRequestError, OSError:
           graph[pageName] = @[]
   
-  # Ausgabe je nach Format
   case format.toLower()
   of "dot", "graphviz":
-    # Graphviz DOT Format - nur den Graph ausgeben
     echo "digraph Notes {"
     echo "  rankdir=LR;"
     echo "  node [shape=box, style=rounded];"
@@ -723,17 +681,12 @@ proc showGraph(format = "text", showAll = false) =
     echo "}"
     
   else:
-    # Text-Ausgabe (Standard)
     var totalLinks = 0
     var isolatedPages: seq[string] = @[]
     
     for page in allPages:
       let outgoing = if page in graph: graph[page].len else: 0
-      var incoming = 0
-      
-      for otherPage, links in graph:
-        if page in links:
-          incoming.inc
+      let incoming = incomingCounts.getOrDefault(page, 0)
       
       if outgoing == 0 and incoming == 0:
         isolatedPages.add(page)
@@ -766,11 +719,11 @@ proc main() =
   for i in 1..paramCount():
     args.add(paramStr(i))
   
-  # Prüfe auf globale Flags
   var showAll = false
   var fullBackup = false
   var targetPrefix = ""
   var verbose = false
+  var force = false
   var i = 0
   while i < args.len:
     if args[i].startsWith("--configfile="):
@@ -786,8 +739,11 @@ proc main() =
     elif args[i] == "--full":
       fullBackup = true
       args.delete(i)
-    elif args[i] == "--verbose" or args[i] == "-v":
+    elif args[i] == "--verbose":
       verbose = true
+      args.delete(i)
+    elif args[i] == "--force" or args[i] == "-f":
+      force = true
       args.delete(i)
     elif args[i].startsWith("--to="):
       targetPrefix = args[i][5..^1]
@@ -807,7 +763,7 @@ proc main() =
     showHelp()
     return
   
-  if command in ["version", "v"]:
+  if command in ["version", "ver"]:
     echo AppName, " v", Version
     return
   
@@ -893,7 +849,7 @@ proc main() =
     if args.len < 2:
       echo "Fehler: Seitenname erforderlich"
       return
-    deletePage(args[1])
+    deletePage(args[1], force)
   
   of "search", "find":
     if args.len < 2:
@@ -913,7 +869,7 @@ proc main() =
       echo "Fehler: Backup-Verzeichnis erforderlich"
       echo "Verwendung: sb restore <backup-verzeichnis> [--to=<ziel-präfix>]"
       return
-    restorePages(args[1], targetPrefix)
+    restorePages(args[1], targetPrefix, verbose)
   
   of "download", "dl":
     if args.len < 2:
