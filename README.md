@@ -98,12 +98,6 @@ sb create "Meeting Notes" "# Meeting with Team"
 echo "# New Note" | sb create "From Pipe"
 ```
 
-#### Edit Existing Page
-```bash
-sb edit "My Notes" "Updated content"
-cat file.txt | sb edit "My Notes"
-```
-
 #### Append to Page
 ```bash
 sb append "Daily Log" "- Completed task X"
@@ -125,7 +119,6 @@ sb search "keyword"
 #### Show Recent Pages
 ```bash
 sb recent              # Last 10 pages
-sb recent --all        # Include system pages
 ```
 
 #### Visualize Page Links
