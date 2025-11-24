@@ -25,19 +25,19 @@ A command-line interface for [SilverBullet](https://silverbullet.md/), the exten
 ```bash
 git clone https://github.com/dnlbrg/silverbullet-cli.git
 cd silverbullet-cli
-nim c -d:release -d:ssl --opt:size sbm.nim
+nim c -d:release -d:ssl --opt:size sb.nim
 ```
 
-This creates an optimized binary `sbm` (or `sbm.exe` on Windows).
+This creates an optimized binary `sb` (or `sb.exe` on Windows).
 
 ### Optional: Add to PATH
 
 ```bash
 # Linux/macOS
-sudo cp sbm /usr/local/bin/sb
+sudo cp sb /usr/local/bin/sb
 
 # Windows
-# Move sbm.exe to a directory in your PATH
+# Move sb.exe to a directory in your PATH
 ```
 
 ## Quick Start
@@ -295,13 +295,13 @@ If you see garbled characters:
 
 ```bash
 # Debug build
-nim c sbm.nim
+nim c sb.nim
 
 # Release build (optimized)
-nim c -d:release -d:ssl --opt:size sbm.nim
+nim c -d:release -d:ssl --opt:size sb.nim
 
 # With additional features
-nim c -d:release -d:ssl --opt:size --threads:on sbm.nim
+nim c -d:release -d:ssl --opt:size --threads:on sb.nim
 ```
 
 ### Testing
