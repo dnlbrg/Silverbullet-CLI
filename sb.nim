@@ -3,71 +3,229 @@ import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re,
 const
   Version = "0.1.0"
   AppName = "SilverBullet CLI"
-  # System-Verzeichnisse die standardmäßig ausgeblendet werden
-  SystemPrefixes = [
-    "Library/",
-    "SETTINGS",
-    "PLUGS",
-    "_"  # Dateien die mit _ beginnen
-  ]
-  # Konstanten für bessere Wartbarkeit
+  SystemPrefixes = ["Library/", "SETTINGS", "PLUGS", "_"]
   DefaultRecentLimit = 10
   MaxSnippetLength = 80
   SeparatorLength = 60
-  HttpTimeoutMs = 30000  # 30 Sekunden
+  HttpTimeoutMs = 30000
   PageContentSeparator = "\n"
 
 type
+  Language = enum
+    langDE = "de"
+    langEN = "en"
+  
   Config = object
     serverUrl: string
     authToken: string
+    language: Language
+
+var translations = {
+  "de": {
+    "config_saved": "Konfiguration gespeichert",
+    "server": "Server",
+    "token": "Token",
+    "total": "Gesamt",
+    "pages": "Seiten",
+    "all": "alle",
+    "without_system": "ohne System-Seiten, verwende --all um alle zu sehen",
+    "showing": "Zeige",
+    "of": "von",
+    "found": "Gefunden",
+    "backed_up": "Gesichert",
+    "files": "Dateien",
+    "skipped": "Übersprungen",
+    "system_files": "System-Dateien (verwende --full für komplettes Backup)",
+    "restored": "Wiederhergestellt",
+    "size": "Größe",
+    "bytes": "Bytes",
+    "page_created": "Seite '$1' erstellt",
+    "page_updated": "Seite '$1' aktualisiert",
+    "page_deleted": "Seite '$1' gelöscht",
+    "page_not_exist": "Seite '$1' existiert nicht, wird erstellt",
+    "text_appended": "Text zu '$1' hinzugefügt",
+    "invalid_pagename": "Ungültiger Seitenname",
+    "backup_success": "Backup erfolgreich nach: $1",
+    "restore_success": "Restore erfolgreich!",
+    "downloaded": "Heruntergeladen",
+    "uploaded": "Hochgeladen",
+    "saved_as": "Gespeichert als",
+    "as_page": "Als Seite",
+    "file_not_found": "Datei nicht gefunden",
+    "backup_dir_not_found": "Backup-Verzeichnis nicht gefunden",
+    "download_error": "Fehler beim Download",
+    "upload_error": "Fehler beim Upload",
+    "aborted": "Abgebrochen.",
+    "confirm_delete": "Seite '$1' wirklich löschen? (j/N): ",
+    "pages_in_sb": "Seiten in SilverBullet",
+    "search_for": "Suche nach: '$1'",
+    "in_title": "(im Titel)",
+    "recent_pages": "Kürzlich geänderte Seiten",
+    "creating_backup": "Erstelle Backup...",
+    "target_dir": "Zielverzeichnis",
+    "restoring_backup": "Stelle Backup wieder her...",
+    "source": "Quelle",
+    "target_prefix": "Ziel-Präfix",
+    "target": "Ziel",
+    "original_paths": "Original-Pfade",
+    "downloading_page": "Lade Seite herunter...",
+    "uploading_file": "Lade Datei hoch...",
+    "analyzing_links": "Analysiere Verlinkungen...",
+    "isolated_pages": "Isolierte Seiten (keine Verlinkungen)",
+    "connections": "Verbindungen",
+    "isolated": "Isoliert",
+    "outgoing_links": "ausgehende Links",
+    "incoming_links": "eingehende Links",
+    "not_found": "(nicht vorhanden)",
+    "could_not_restore": "Dateien konnten nicht wiederhergestellt werden",
+    "error_no_url": "Keine Server-URL konfiguriert!",
+    "error_use": "Verwende: sb config <server-url>",
+    "error_example": "Beispiel:",
+    "error_pagename_required": "Fehler: Seitenname erforderlich",
+    "error_query_required": "Fehler: Suchbegriff erforderlich",
+    "error_url_required": "Fehler: Server-URL erforderlich",
+    "error_backup_dir_required": "Fehler: Backup-Verzeichnis erforderlich",
+    "error_no_content": "Fehler: Kein Inhalt angegeben",
+    "error_file_and_page_required": "Fehler: Quelldatei und Seitenname erforderlich",
+    "error_unknown_command": "Unbekannter Befehl",
+    "error_use_help": "Verwende 'sb help' für Hilfe",
+    "usage_config": "Verwendung: sb config <url> [token]",
+    "usage_create": "Verwendung: sb create <page> [<text>]",
+    "usage_restore": "Verwendung: sb restore <backup-verzeichnis> [--to=<ziel-präfix>]",
+    "usage_download": "Verwendung: sb download <page> [<ausgabedatei>]",
+    "usage_upload": "Verwendung: sb upload <datei> <page>",
+    "language_set": "Sprache gesetzt auf"
+  }.toTable,
+  
+  "en": {
+    "config_saved": "Configuration saved",
+    "server": "Server",
+    "token": "Token",
+    "total": "Total",
+    "pages": "pages",
+    "all": "all",
+    "without_system": "without system pages, use --all to show all",
+    "showing": "Showing",
+    "of": "of",
+    "found": "Found",
+    "backed_up": "Backed up",
+    "files": "files",
+    "skipped": "Skipped",
+    "system_files": "system files (use --full for complete backup)",
+    "restored": "Restored",
+    "size": "Size",
+    "bytes": "bytes",
+    "page_created": "Page '$1' created",
+    "page_updated": "Page '$1' updated",
+    "page_deleted": "Page '$1' deleted",
+    "page_not_exist": "Page '$1' does not exist, creating",
+    "text_appended": "Text appended to '$1'",
+    "invalid_pagename": "Invalid page name",
+    "backup_success": "Backup successful to: $1",
+    "restore_success": "Restore successful!",
+    "downloaded": "Downloaded",
+    "uploaded": "Uploaded",
+    "saved_as": "Saved as",
+    "as_page": "As page",
+    "file_not_found": "File not found",
+    "backup_dir_not_found": "Backup directory not found",
+    "download_error": "Download error",
+    "upload_error": "Upload error",
+    "aborted": "Aborted.",
+    "confirm_delete": "Really delete page '$1'? (y/N): ",
+    "pages_in_sb": "Pages in SilverBullet",
+    "search_for": "Search for: '$1'",
+    "in_title": "(in title)",
+    "recent_pages": "Recently changed pages",
+    "creating_backup": "Creating backup...",
+    "target_dir": "Target directory",
+    "restoring_backup": "Restoring backup...",
+    "source": "Source",
+    "target_prefix": "Target prefix",
+    "target": "Target",
+    "original_paths": "Original paths",
+    "downloading_page": "Downloading page...",
+    "uploading_file": "Uploading file...",
+    "analyzing_links": "Analyzing links...",
+    "isolated_pages": "Isolated pages (no links)",
+    "connections": "Connections",
+    "isolated": "Isolated",
+    "outgoing_links": "outgoing links",
+    "incoming_links": "incoming links",
+    "not_found": "(not found)",
+    "could_not_restore": "files could not be restored",
+    "error_no_url": "No server URL configured!",
+    "error_use": "Use: sb config <server-url>",
+    "error_example": "Example:",
+    "error_pagename_required": "Error: Page name required",
+    "error_query_required": "Error: Search query required",
+    "error_url_required": "Error: Server URL required",
+    "error_backup_dir_required": "Error: Backup directory required",
+    "error_no_content": "Error: No content provided",
+    "error_file_and_page_required": "Error: Source file and page name required",
+    "error_unknown_command": "Unknown command",
+    "error_use_help": "Use 'sb help' for help",
+    "usage_config": "Usage: sb config <url> [token]",
+    "usage_create": "Usage: sb create <page> [<text>]",
+    "usage_restore": "Usage: sb restore <backup-directory> [--to=<target-prefix>]",
+    "usage_download": "Usage: sb download <page> [<output-file>]",
+    "usage_upload": "Usage: sb upload <file> <page>",
+    "language_set": "Language set to"
+  }.toTable
+}.toTable
 
 var config: Config
 var configFile = getConfigDir() / "silverbullet-cli" / "config.json"
 
-## Prüft ob eine Seite eine System-Seite ist
+proc t(key: string, args: varargs[string]): string =
+  let lang = $config.language
+  if lang in translations and key in translations[lang]:
+    result = translations[lang][key]
+    for i, arg in args:
+      result = result.replace("$" & $(i+1), arg)
+  else:
+    result = key
+
 proc isSystemPage(pageName: string): bool =
   for prefix in SystemPrefixes:
     if pageName.startsWith(prefix):
       return true
   return false
 
-## Helper: Prüft ob Seite angezeigt werden soll
 proc shouldIncludePage(pageName: string, showAll: bool): bool =
   showAll or not isSystemPage(pageName)
 
-## Validiert Seitennamen auf gefährliche Zeichen
 proc validatePageName(name: string): bool =
   not (name.contains("..") or name.contains("\0") or name.len == 0)
 
-## Helper: Erstellt Endpoint-URL für eine Seite
 proc getPageEndpoint(pageName: string): string =
   "/.fs/" & encodeUrl(pageName) & ".md"
 
-## Formatiert eine Zahl mit führenden Nullen
 proc formatWithLeadingZeros(num: int, width: int): string =
   ($num).align(width, '0')
 
-## Lädt Konfiguration aus der JSON-Datei (falls vorhanden).
 proc loadConfig() =
   if fileExists(configFile):
     try:
       let data = parseFile(configFile)
       config.serverUrl = data{"serverUrl"}.getStr("")
       config.authToken = data{"authToken"}.getStr("")
+      let langStr = data{"language"}.getStr("en")
+      config.language = if langStr == "de": langDE else: langEN
     except CatchableError:
-      discard
+      config.language = langEN
+  else:
+    config.language = langEN
 
-## Speichert die aktuelle Konfiguration (Server-URL, Token) als JSON-Datei.
 proc saveConfig() =
   createDir(parentDir(configFile))
   let data = %* {
     "serverUrl": config.serverUrl,
-    "authToken": config.authToken
+    "authToken": config.authToken,
+    "language": $config.language
   }
   writeFile(configFile, data.pretty())
 
-## Liest Text von der Standard-Eingabe (stdin) ein.
 proc readFromStdin(): string =
   var content = ""
   var line: string
@@ -77,8 +235,7 @@ proc readFromStdin(): string =
     content.add(line)
   return content
 
-## Zeigt Progress-Anzeige
-proc showProgress(current, total: int, label = "Fortschritt") =
+proc showProgress(current, total: int, label: string) =
   if total == 0: return
   let percent = (current * 100) div total
   let barWidth = 30
@@ -89,9 +246,8 @@ proc showProgress(current, total: int, label = "Fortschritt") =
   stdout.write("] " & $percent & "% (" & $current & "/" & $total & ")")
   stdout.flushFile()
   if current == total:
-    echo ""  # Neue Zeile am Ende
+    echo ""
 
-## Führt eine HTTP-Anfrage aus (GET/PUT/DELETE)
 proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, body = ""): string =
   let url = config.serverUrl & endpoint
   
@@ -128,19 +284,17 @@ proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, b
     styledEcho(fgRed, "✗ HTTP Error: ", resetStyle, e.msg)
     quit(1)
   except OSError as e:
-    # OSError wird bei Timeouts geworfen
     if "timeout" in e.msg.toLower():
-      styledEcho(fgRed, "✗ Timeout: ", resetStyle, "Server antwortet nicht (>30s)")
+      styledEcho(fgRed, "✗ Timeout: ", resetStyle, "Server not responding (>30s)")
     else:
-      styledEcho(fgRed, "✗ Netzwerkfehler: ", resetStyle, e.msg)
+      styledEcho(fgRed, "✗ Network Error: ", resetStyle, e.msg)
     quit(1)
   except Exception as e:
     styledEcho(fgRed, "✗ Error: ", resetStyle, e.msg)
     quit(1)
 
-## Druckt die Hilfe
 proc showHelp() =
-  echo """
+  let helpTextDE = """
 $1 v$2
 
 VERWENDUNG:
@@ -148,6 +302,7 @@ VERWENDUNG:
 
 BEFEHLE:
   config <url> [token]    Konfiguriert Server-URL und optionalen Auth-Token
+  lang <de|en>            Setzt die Sprache
   list                    Listet alle Seiten auf
   get <page>              Zeigt Inhalt einer Seite an
   create <page> <text>    Erstellt eine neue Seite
@@ -166,32 +321,70 @@ BEFEHLE:
 
 GLOBALE OPTIONEN:
   --configfile=<pfad>     Verwendet alternative Konfigurationsdatei
-  --all, -a               Zeigt auch System-Seiten (Library/, SETTINGS, etc.)
+  --all, -a               Zeigt auch System-Seiten
   --full                  Bei backup/restore: inkl. System-Seiten
-  --verbose               Zeigt detaillierte Ausgaben bei backup/restore
-  --force, -f             Überspringt Bestätigungen (z.B. bei delete)
-  --to=<pfad>             Bei restore: Ziel-Präfix für wiederhergestellte Dateien
+  --verbose               Zeigt detaillierte Ausgaben
+  --force, -f             Überspringt Bestätigungen
+  --to=<pfad>             Bei restore: Ziel-Präfix
 
 BEISPIELE:
   sb config http://localhost:3000
+  sb lang de
   sb list
-  sb get index
-  sb create "Meeting Notes" "# Meeting"
-  sb append index "- New item"
-  sb delete "Test Page"
   sb delete "Test Page" -f
-  sb search "TODO"
-  sb backup
   sb backup --verbose
-  sb restore backup-23112025-143025
-  sb restore backup-23112025-143025 --verbose
 
 KONFIGURATION:
-  Die Konfiguration wird standardmäßig gespeichert in:
-  $3
-""" % [AppName, Version, configFile]
+  Die Konfiguration wird gespeichert in: $3
+"""
 
-## Setzt/normalisiert die Server-URL und speichert den Token
+  let helpTextEN = """
+$1 v$2
+
+USAGE:
+  sb [COMMAND] [OPTIONS]
+
+COMMANDS:
+  config <url> [token]    Configure server URL and optional auth token
+  lang <de|en>            Set language
+  list                    List all pages
+  get <page>              Show page content
+  create <page> <text>    Create a new page
+  edit <page> <text>      Edit an existing page
+  append <page> <text>    Append text to a page
+  delete <page>           Delete a page (with confirmation)
+  search <query>          Search all pages
+  recent                  Show recently changed pages
+  backup [directory]      Create a backup of all pages
+  restore <directory>     Restore pages from backup
+  download <page> [file]  Download a page to a local file
+  upload <file> <page>    Upload a local file as a page
+  graph [format]          Show links between pages (text, dot)
+  version                 Show version
+  help                    Show this help
+
+GLOBAL OPTIONS:
+  --configfile=<path>     Use alternative config file
+  --all, -a               Show system pages too
+  --full                  For backup/restore: incl. system pages
+  --verbose               Show detailed output
+  --force, -f             Skip confirmations
+  --to=<path>             For restore: target prefix
+
+EXAMPLES:
+  sb config http://localhost:3000
+  sb lang en
+  sb list
+  sb delete "Test Page" -f
+  sb backup --verbose
+
+CONFIGURATION:
+  Configuration is saved in: $3
+"""
+
+  let helpText = if config.language == langDE: helpTextDE else: helpTextEN
+  echo helpText % [AppName, Version, configFile]
+
 proc configureServer(url: string, token = "") =
   var serverUrl = url.strip(chars = {'/'})
   
@@ -201,12 +394,24 @@ proc configureServer(url: string, token = "") =
   config.serverUrl = serverUrl
   config.authToken = token
   saveConfig()
-  styledEcho(fgGreen, "✓ ", resetStyle, "Konfiguration gespeichert")
-  echo "Server: ", config.serverUrl
+  styledEcho(fgGreen, "✓ ", resetStyle, t("config_saved"))
+  echo t("server"), ": ", config.serverUrl
   if token != "":
-    echo "Token: ********"
+    echo t("token"), ": ********"
 
-## Fragt die Dateiliste am Server ab und zeigt sie an
+proc setLanguage(lang: string) =
+  case lang.toLower()
+  of "de", "deutsch", "german":
+    config.language = langDE
+  of "en", "english", "englisch":
+    config.language = langEN
+  else:
+    echo "Unknown language. Use: de or en"
+    return
+  
+  saveConfig()
+  styledEcho(fgGreen, "✓ ", resetStyle, t("language_set"), ": ", $config.language)
+
 proc listPages(showAll = false) =
   let client = newHttpClient()
   defer: client.close()
@@ -216,7 +421,7 @@ proc listPages(showAll = false) =
   try:
     let data = parseJson(response)
     
-    echo "\n📄 Seiten in SilverBullet\n"
+    echo "\n📄 ", t("pages_in_sb"), "\n"
     echo "─".repeat(SeparatorLength)
     
     var pages: seq[tuple[name: string, lastModified: int]] = @[]
@@ -249,20 +454,16 @@ proc listPages(showAll = false) =
     
     echo "─".repeat(SeparatorLength)
     if showAll:
-      echo "Gesamt: ", pages.len, " Seiten (alle)"
+      echo t("total"), ": ", pages.len, " ", t("pages"), " (", t("all"), ")"
     else:
-      echo "Gesamt: ", pages.len, " Seiten (ohne System-Seiten, verwende --all um alle zu sehen)"
+      echo t("total"), ": ", pages.len, " ", t("pages"), " (", t("without_system"), ")"
   except JsonParsingError as e:
     styledEcho(fgRed, "✗ JSON Parse Error: ", resetStyle, e.msg)
-    echo "Server response (first 500 chars):"
-    if response.len > 0:
-      echo response[0..min(response.len-1, 500)]
     quit(1)
 
-## Holt den Inhalt einer Seite und zeigt ihn an
 proc getPage(pageName: string) =
   if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
     quit(1)
   
   let client = newHttpClient()
@@ -271,10 +472,9 @@ proc getPage(pageName: string) =
   let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
   echo content
 
-## Erstellt oder überschreibt eine Seite
 proc createOrEditPage(pageName: string, content: string, isEdit = false) =
   if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
     quit(1)
   
   let client = newHttpClient()
@@ -282,63 +482,55 @@ proc createOrEditPage(pageName: string, content: string, isEdit = false) =
   
   discard makeRequest(client, HttpPut, getPageEndpoint(pageName), content)
   
-  let action = if isEdit: "aktualisiert" else: "erstellt"
-  styledEcho(fgGreen, "✓ ", resetStyle, "Seite '", pageName, "' ", action)
+  let msg = if isEdit: t("page_updated", pageName) else: t("page_created", pageName)
+  styledEcho(fgGreen, "✓ ", resetStyle, msg)
 
-## Hängt Text an eine Seite an
 proc appendToPage(pageName: string, content: string) =
   if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
     quit(1)
   
   let client = newHttpClient()
   defer: client.close()
   
-  # Versuche existierenden Inhalt zu holen
   var currentContent = ""
   try:
     currentContent = makeRequest(client, HttpGet, getPageEndpoint(pageName))
   except CatchableError:
-    # Seite existiert nicht - wird neu erstellt
-    styledEcho(fgYellow, "ℹ ", resetStyle, "Seite '", pageName, "' existiert nicht, wird erstellt")
+    styledEcho(fgYellow, "ℹ ", resetStyle, t("page_not_exist", pageName))
   
-  # Baue neuen Inhalt zusammen
   var newContent = currentContent
   if currentContent.len > 0 and not currentContent.endsWith("\n"):
     newContent.add(PageContentSeparator)
   
   newContent.add(content)
   
-  # Stelle sicher dass Datei mit Newline endet
   if not newContent.endsWith("\n"):
     newContent.add("\n")
   
-  # Speichere zurück
   discard makeRequest(client, HttpPut, getPageEndpoint(pageName), newContent)
-  styledEcho(fgGreen, "✓ ", resetStyle, "Text zu '", pageName, "' hinzugefügt")
+  styledEcho(fgGreen, "✓ ", resetStyle, t("text_appended", pageName))
 
-## Löscht eine Seite (mit optionaler Bestätigung)
 proc deletePage(pageName: string, force = false) =
   if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
     quit(1)
   
-  # Frage nach Bestätigung, außer --force
   if not force:
-    stdout.styledWrite(fgYellow, "⚠ ", resetStyle, "Seite '", pageName, "' wirklich löschen? (j/N): ")
+    stdout.styledWrite(fgYellow, "⚠ ", resetStyle, t("confirm_delete", pageName))
     stdout.flushFile()
     let answer = stdin.readLine().toLower()
-    if answer != "j" and answer != "ja" and answer != "y" and answer != "yes":
-      echo "Abgebrochen."
+    let confirmChars = if config.language == langDE: ["j", "ja"] else: ["y", "yes"]
+    if answer notin confirmChars:
+      echo t("aborted")
       return
   
   let client = newHttpClient()
   defer: client.close()
   
   discard makeRequest(client, HttpDelete, getPageEndpoint(pageName))
-  styledEcho(fgRed, "✗ ", resetStyle, "Seite '", pageName, "' gelöscht")
+  styledEcho(fgRed, "✗ ", resetStyle, t("page_deleted", pageName))
 
-## Durchsucht alle Seiten
 proc searchPages(query: string) =
   let client = newHttpClient()
   defer: client.close()
@@ -346,7 +538,7 @@ proc searchPages(query: string) =
   let response = makeRequest(client, HttpGet, "/.fs")
   let data = parseJson(response)
   
-  echo "\n🔍 Suche nach: '", query, "'\n"
+  echo "\n🔍 ", t("search_for", query)
   echo "─".repeat(SeparatorLength)
   
   var found = 0
@@ -358,7 +550,7 @@ proc searchPages(query: string) =
         
         if query.toLower() in pageName.toLower():
           found.inc
-          styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgYellow, "(im Titel)")
+          styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgYellow, t("in_title"))
           continue
         
         try:
@@ -376,11 +568,10 @@ proc searchPages(query: string) =
                 break
         except HttpRequestError, OSError:
           discard
-
+  
   echo "─".repeat(SeparatorLength)
-  echo "Gefunden: ", found, " Seiten"
+  echo t("found"), ": ", found, " ", t("pages")
 
-## Zeigt die zuletzt geänderten Seiten
 proc showRecent(limit = DefaultRecentLimit, showAll = false) =
   let client = newHttpClient()
   defer: client.close()
@@ -388,7 +579,7 @@ proc showRecent(limit = DefaultRecentLimit, showAll = false) =
   let response = makeRequest(client, HttpGet, "/.fs")
   let data = parseJson(response)
   
-  echo "\n🕐 Kürzlich geänderte Seiten\n"
+  echo "\n🕐 ", t("recent_pages"), "\n"
   echo "─".repeat(SeparatorLength)
   
   var pages: seq[tuple[name: string, lastModified: int]] = @[]
@@ -421,11 +612,10 @@ proc showRecent(limit = DefaultRecentLimit, showAll = false) =
   
   echo "─".repeat(SeparatorLength)
   if showAll:
-    echo "Zeige ", min(limit, pages.len), " von ", pages.len, " Seiten (alle)"
+    echo t("showing"), " ", min(limit, pages.len), " ", t("of"), " ", pages.len, " ", t("pages"), " (", t("all"), ")"
   else:
-    echo "Zeige ", min(limit, pages.len), " von ", pages.len, " Seiten (ohne System-Seiten, verwende --all um alle zu sehen)"
+    echo t("showing"), " ", min(limit, pages.len), " ", t("of"), " ", pages.len, " ", t("pages"), " (", t("without_system"), ")"
 
-## Erstellt ein Backup aller Seiten
 proc backupPages(targetDir = "", fullBackup = false, verbose = false) =
   let client = newHttpClient()
   defer: client.close()
@@ -436,8 +626,8 @@ proc backupPages(targetDir = "", fullBackup = false, verbose = false) =
   else:
     getCurrentDir() / "backup-" & timestamp
   
-  echo "\n💾 Erstelle Backup..."
-  echo "Zielverzeichnis: ", backupPath
+  echo "\n💾 ", t("creating_backup")
+  echo t("target_dir"), ": ", backupPath
   echo "─".repeat(SeparatorLength)
   
   createDir(backupPath)
@@ -488,26 +678,25 @@ proc backupPages(targetDir = "", fullBackup = false, verbose = false) =
           styledEcho(fgRed, "✗ ", resetStyle, name, " (", e.msg, ")")
   
   echo "─".repeat(SeparatorLength)
-  echo "Gesichert: ", backedUp, " Dateien"
+  echo t("backed_up"), ": ", backedUp, " ", t("files")
   if skipped > 0:
-    echo "Übersprungen: ", skipped, " System-Dateien (verwende --full für komplettes Backup)"
-  styledEcho(fgGreen, "✓ ", resetStyle, "Backup erfolgreich nach: ", backupPath)
+    echo t("skipped"), ": ", skipped, " ", t("system_files")
+  styledEcho(fgGreen, "✓ ", resetStyle, t("backup_success", backupPath))
 
-## Stellt Seiten aus einem Backup wieder her
 proc restorePages(sourceDir: string, targetPrefix = "", verbose = false) =
   let client = newHttpClient()
   defer: client.close()
   
   if not dirExists(sourceDir):
-    styledEcho(fgRed, "✗ ", resetStyle, "Backup-Verzeichnis nicht gefunden: ", sourceDir)
+    styledEcho(fgRed, "✗ ", resetStyle, t("backup_dir_not_found"), ": ", sourceDir)
     quit(1)
   
-  echo "\n📦 Stelle Backup wieder her..."
-  echo "Quelle: ", sourceDir
+  echo "\n📦 ", t("restoring_backup")
+  echo t("source"), ": ", sourceDir
   if targetPrefix != "":
-    echo "Ziel-Präfix: ", targetPrefix, "/"
+    echo t("target_prefix"), ": ", targetPrefix, "/"
   else:
-    echo "Ziel: Original-Pfade"
+    echo t("target"), ": ", t("original_paths")
   echo "─".repeat(SeparatorLength)
   
   var allFiles: seq[string] = @[]
@@ -548,22 +737,21 @@ proc restorePages(sourceDir: string, targetPrefix = "", verbose = false) =
       styledEcho(fgRed, "✗ ", resetStyle, relPath, " (", e.msg, ")")
   
   echo "─".repeat(SeparatorLength)
-  echo "Wiederhergestellt: ", restored, " Dateien"
+  echo t("restored"), ": ", restored, " ", t("files")
   if failed > 0:
-    echo "⚠ ", failed, " Dateien konnten nicht wiederhergestellt werden"
+    echo "⚠ ", failed, " ", t("could_not_restore")
   if restored > 0:
-    styledEcho(fgGreen, "✓ ", resetStyle, "Restore erfolgreich!")
+    styledEcho(fgGreen, "✓ ", resetStyle, t("restore_success"))
 
-## Lädt eine Seite in eine lokale Datei herunter
 proc downloadPage(pageName: string, outputFile = "") =
   if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
     quit(1)
   
   let client = newHttpClient()
   defer: client.close()
   
-  echo "\n📥 Lade Seite herunter..."
+  echo "\n📥 ", t("downloading_page")
   
   try:
     let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
@@ -575,26 +763,25 @@ proc downloadPage(pageName: string, outputFile = "") =
     
     writeFile(filename, content)
     
-    styledEcho(fgGreen, "✓ ", resetStyle, "Heruntergeladen: ", pageName)
-    echo "Gespeichert als: ", filename
-    echo "Größe: ", content.len, " Bytes"
+    styledEcho(fgGreen, "✓ ", resetStyle, t("downloaded"), ": ", pageName)
+    echo t("saved_as"), ": ", filename
+    echo t("size"), ": ", content.len, " ", t("bytes")
   except CatchableError as e:
-    styledEcho(fgRed, "✗ ", resetStyle, "Fehler beim Download: ", e.msg)
+    styledEcho(fgRed, "✗ ", resetStyle, t("download_error"), ": ", e.msg)
     quit(1)
 
-## Lädt eine lokale Datei als Seite hoch
 proc uploadPage(sourceFile: string, pageName: string) =
   if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, "Ungültiger Seitenname")
+    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
     quit(1)
   
   let client = newHttpClient()
   defer: client.close()
   
-  echo "\n📤 Lade Datei hoch..."
+  echo "\n📤 ", t("uploading_file")
   
   if not fileExists(sourceFile):
-    styledEcho(fgRed, "✗ ", resetStyle, "Datei nicht gefunden: ", sourceFile)
+    styledEcho(fgRed, "✗ ", resetStyle, t("file_not_found"), ": ", sourceFile)
     quit(1)
   
   try:
@@ -602,14 +789,13 @@ proc uploadPage(sourceFile: string, pageName: string) =
     
     discard makeRequest(client, HttpPut, getPageEndpoint(pageName), content)
     
-    styledEcho(fgGreen, "✓ ", resetStyle, "Hochgeladen: ", sourceFile)
-    echo "Als Seite: ", pageName
-    echo "Größe: ", content.len, " Bytes"
+    styledEcho(fgGreen, "✓ ", resetStyle, t("uploaded"), ": ", sourceFile)
+    echo t("as_page"), ": ", pageName
+    echo t("size"), ": ", content.len, " ", t("bytes")
   except CatchableError as e:
-    styledEcho(fgRed, "✗ ", resetStyle, "Fehler beim Upload: ", e.msg)
+    styledEcho(fgRed, "✗ ", resetStyle, t("upload_error"), ": ", e.msg)
     quit(1)
 
-## Extrahiert Wiki-Links aus Markdown-Text
 proc extractLinks(content: string): seq[string] =
   var links: seq[string] = @[]
   let pattern = re"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]"
@@ -626,13 +812,12 @@ proc extractLinks(content: string): seq[string] =
   
   return links
 
-## Erstellt einen Graph der Verlinkungen zwischen Seiten
 proc showGraph(format = "text", showAll = false) =
   let client = newHttpClient()
   defer: client.close()
   
   if format.toLower() == "text":
-    echo "\n🔗 Analysiere Verlinkungen..."
+    echo "\n🔗 ", t("analyzing_links")
     echo "─".repeat(SeparatorLength)
   
   let response = makeRequest(client, HttpGet, "/.fs")
@@ -692,28 +877,27 @@ proc showGraph(format = "text", showAll = false) =
         isolatedPages.add(page)
       elif outgoing > 0:
         echo "\n📄 ", page
-        echo "  → ", outgoing, " ausgehende Links:"
+        echo "  → ", outgoing, " ", t("outgoing_links"), ":"
         if page in graph:
           for link in graph[page]:
             if link in allPages:
               echo "    • ", link
               totalLinks.inc
             else:
-              echo "    • ", link, " (nicht vorhanden)"
+              echo "    • ", link, " ", t("not_found")
         if incoming > 0:
-          echo "  ← ", incoming, " eingehende Links"
+          echo "  ← ", incoming, " ", t("incoming_links")
     
     if isolatedPages.len > 0:
-      echo "\n🔷 Isolierte Seiten (keine Verlinkungen):"
+      echo "\n🔷 ", t("isolated_pages"), ":"
       for page in isolatedPages:
         echo "  • ", page
     
     echo "\n─".repeat(SeparatorLength)
-    echo "Seiten: ", allPages.len
-    echo "Verbindungen: ", totalLinks
-    echo "Isoliert: ", isolatedPages.len
+    echo t("pages"), ": ", allPages.len
+    echo t("connections"), ": ", totalLinks
+    echo t("isolated"), ": ", isolatedPages.len
 
-## Hauptfunktion
 proc main() =
   var args: seq[string] = @[]
   for i in 1..paramCount():
@@ -769,19 +953,26 @@ proc main() =
   
   if command == "config":
     if args.len < 2:
-      echo "Fehler: Server-URL erforderlich"
-      echo "Verwendung: sb config <url> [token]"
+      echo t("error_url_required")
+      echo t("usage_config")
       return
     let url = args[1]
     let token = if args.len >= 3: args[2] else: ""
     configureServer(url, token)
     return
   
+  if command in ["lang", "language"]:
+    if args.len < 2:
+      echo "Error: Language required (de or en)"
+      return
+    setLanguage(args[1])
+    return
+  
   if config.serverUrl == "":
-    styledEcho(fgRed, "✗ ", resetStyle, "Keine Server-URL konfiguriert!")
-    echo "Verwende: sb config <server-url>"
+    styledEcho(fgRed, "✗ ", resetStyle, t("error_no_url"))
+    echo t("error_use")
     echo ""
-    echo "Beispiel:"
+    echo t("error_example")
     echo "  sb config http://localhost:3000"
     echo "  sb config https://your-server.com"
     quit(1)
@@ -792,14 +983,14 @@ proc main() =
   
   of "get", "show", "cat":
     if args.len < 2:
-      echo "Fehler: Seitenname erforderlich"
+      echo t("error_pagename_required")
       return
     getPage(args[1])
   
   of "create", "new":
     if args.len < 2:
-      echo "Fehler: Seitenname erforderlich"
-      echo "Verwendung: sb create <page> [<text>]"
+      echo t("error_pagename_required")
+      echo t("usage_create")
       return
     let pageName = args[1]
     let content = if args.len >= 3:
@@ -808,14 +999,14 @@ proc main() =
       readFromStdin()
     
     if content.len == 0:
-      echo "Fehler: Kein Inhalt angegeben"
+      echo t("error_no_content")
       return
     
     createOrEditPage(pageName, content)
   
   of "edit", "update":
     if args.len < 2:
-      echo "Fehler: Seitenname erforderlich"
+      echo t("error_pagename_required")
       return
     let pageName = args[1]
     let content = if args.len >= 3:
@@ -824,14 +1015,14 @@ proc main() =
       readFromStdin()
     
     if content.len == 0:
-      echo "Fehler: Kein Inhalt angegeben"
+      echo t("error_no_content")
       return
     
     createOrEditPage(pageName, content, isEdit = true)
   
   of "append", "add":
     if args.len < 2:
-      echo "Fehler: Seitenname erforderlich"
+      echo t("error_pagename_required")
       return
     let pageName = args[1]
     let content = if args.len >= 3:
@@ -840,20 +1031,20 @@ proc main() =
       readFromStdin()
     
     if content.len == 0:
-      echo "Fehler: Kein Inhalt angegeben"
+      echo t("error_no_content")
       return
     
     appendToPage(pageName, content)
   
   of "delete", "rm", "del":
     if args.len < 2:
-      echo "Fehler: Seitenname erforderlich"
+      echo t("error_pagename_required")
       return
     deletePage(args[1], force)
   
   of "search", "find":
     if args.len < 2:
-      echo "Fehler: Suchbegriff erforderlich"
+      echo t("error_query_required")
       return
     searchPages(args[1])
   
@@ -866,23 +1057,23 @@ proc main() =
   
   of "restore":
     if args.len < 2:
-      echo "Fehler: Backup-Verzeichnis erforderlich"
-      echo "Verwendung: sb restore <backup-verzeichnis> [--to=<ziel-präfix>]"
+      echo t("error_backup_dir_required")
+      echo t("usage_restore")
       return
     restorePages(args[1], targetPrefix, verbose)
   
   of "download", "dl":
     if args.len < 2:
-      echo "Fehler: Seitenname erforderlich"
-      echo "Verwendung: sb download <page> [<ausgabedatei>]"
+      echo t("error_pagename_required")
+      echo t("usage_download")
       return
     let outputFile = if args.len >= 3: args[2] else: ""
     downloadPage(args[1], outputFile)
   
   of "upload", "ul":
     if args.len < 3:
-      echo "Fehler: Quelldatei und Seitenname erforderlich"
-      echo "Verwendung: sb upload <datei> <page>"
+      echo t("error_file_and_page_required")
+      echo t("usage_upload")
       return
     uploadPage(args[1], args[2])
   
@@ -891,8 +1082,8 @@ proc main() =
     showGraph(format, showAll)
   
   else:
-    echo "Unbekannter Befehl: ", command
-    echo "Verwende 'sb help' für Hilfe"
+    echo t("error_unknown_command"), ": ", command
+    echo t("error_use_help")
 
 when isMainModule:
   main()
