@@ -1,5 +1,5 @@
 import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re, sets, tables, parseopt, atomics]
-import std/[locks, cpuinfo, editdistance] # threadpool wurde hier entfernt
+import std/[locks, cpuinfo, editdistance] 
 import i18n
 
 const
@@ -15,12 +15,15 @@ const
   MaxRetries = 3
   RetryDelayMs = 500
 
-  ValidCommands = ["config", "lang", "list", "ls", "get", "show", "cat", "create", "new", 
+  ValidCommands = ["config", "lang", "language", "list", "ls", "get", "show", "cat", "create", "new", 
                    "edit", "update", "append", "add", "delete", "rm", "del", "search", "find", 
                    "recent", "backup", "restore", "download", "dl", "upload", "ul", "graph", 
-                   "help", "version"]
+                   "help", "h", "version", "ver"]
 
 type
+  NotFoundError* = object of CatchableError
+  ServerError* = object of CatchableError
+
   Config = object
     serverUrl: string
     authToken: string
@@ -36,7 +39,6 @@ type
     command: string
     args: seq[string]
 
-  # Typen für die neuen Native Threads
   BackupArgs = tuple
     files: seq[string]
     backupPath: string
@@ -56,11 +58,9 @@ var configFile = getConfigDir() / "silverbullet-cli" / "config.json"
 
 # Threading & Shutdown Globals
 var consoleLock: Lock
-var progressLock: Lock
-var processedCount: int
+var processedCount: Atomic[int]
 var globalTotal: int
 
-# Atomic statt volatile für Thread-Sicherheit
 var shuttingDown: Atomic[bool]
 shuttingDown.store(false)
 
@@ -69,20 +69,19 @@ proc t(key: string, args: varargs[string]): string =
 
 # --- STRG+C HANDLER ---
 proc ctrlCHandler() {.noconv.} =
-  # Nur das Flag setzen, KEIN echo (I/O) im Signal-Handler!
   shuttingDown.store(true)
 
 proc isSystemPage(pageName: string): bool =
   for prefix in SystemPrefixes:
-    if pageName.startsWith(prefix):
-      return true
+    if pageName.startsWith(prefix): return true
   return false
 
 proc shouldIncludePage(pageName: string, showAll: bool): bool =
   showAll or not isSystemPage(pageName)
 
-proc validatePageName(name: string): bool =
-  not (name.contains("..") or name.contains("\0") or name.len == 0)
+proc ensureValidPageName(name: string) =
+  if name.contains("..") or name.contains("\0") or name.len == 0:
+    raise newException(ValueError, t("invalid_pagename"))
 
 proc getPageEndpoint(pageName: string): string =
   "/.fs/" & encodeUrl(pageName) & ".md"
@@ -97,10 +96,8 @@ proc loadConfig() =
       config.serverUrl = data{"serverUrl"}.getStr("")
       config.authToken = data{"authToken"}.getStr("")
       let langStr = data{"language"}.getStr("en")
-      if langStr == "de":
-        config.language = langDE
-      else:
-        config.language = langEN
+      if langStr == "de": config.language = langDE
+      else: config.language = langEN
     except CatchableError:
       config.language = langEN
   else:
@@ -114,12 +111,8 @@ proc saveConfig() =
     "language": $config.language
   }
   writeFile(configFile, data.pretty())
-  
-  # Dateiberechtigungen auf 600 setzen (User Read/Write)
-  try:
-    setFilePermissions(configFile, {fpUserRead, fpUserWrite})
-  except CatchableError:
-    discard
+  try: setFilePermissions(configFile, {fpUserRead, fpUserWrite})
+  except CatchableError: discard
 
 # --- CONFIG FUNCTIONS ---
 
@@ -132,18 +125,14 @@ proc configureServer(url: string, token = "") =
   saveConfig()
   styledEcho(fgGreen, "✓ ", resetStyle, t("config_saved"))
   echo t("server"), ": ", config.serverUrl
-  if token != "":
-    echo t("token"), ": ********"
+  if token != "": echo t("token"), ": ********"
 
 proc setLanguage(lang: string) =
   case lang.toLower()
-  of "de", "deutsch", "german":
-    config.language = langDE
-  of "en", "english", "englisch":
-    config.language = langEN
+  of "de", "deutsch", "german": config.language = langDE
+  of "en", "english", "englisch": config.language = langEN
   else:
-    echo "Unknown language. Use: de or en"
-    return
+    raise newException(ValueError, t("unknown_language"))
   saveConfig()
   styledEcho(fgGreen, "✓ ", resetStyle, t("language_set"), ": ", $config.language)
 
@@ -151,8 +140,7 @@ proc readFromStdin(): string =
   var content = ""
   var line: string
   while stdin.readLine(line):
-    if content.len > 0:
-      content.add("\n")
+    if content.len > 0: content.add("\n")
     content.add(line)
   return content
 
@@ -162,13 +150,14 @@ proc showProgress(current, total: int, label: string) =
   let barWidth = 30
   let filled = (percent * barWidth) div 100
   let barColor = if percent == 100: fgGreen else: fgCyan
-  stdout.write("\r" & label & ": [")
-  stdout.styledWrite(barColor, "=".repeat(filled))
-  stdout.write(" ".repeat(barWidth - filled))
-  stdout.write("] " & $percent & "% (" & $current & "/" & $total & ")")
-  stdout.flushFile()
-  if current == total:
-    echo ""
+  
+  withLock consoleLock:
+    stdout.write("\r" & label & ": [")
+    stdout.styledWrite(barColor, "=".repeat(filled))
+    stdout.write(" ".repeat(barWidth - filled))
+    stdout.write("] " & $percent & "% (" & $current & "/" & $total & ")")
+    stdout.flushFile()
+    if current == total: echo ""
 
 # --- CLIENT ---
 
@@ -189,8 +178,7 @@ proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, b
     try:
       var response: Response
       case httpMethod
-      of HttpGet:
-        response = client.get(url)
+      of HttpGet: response = client.get(url)
       of HttpPut:
         client.headers["Content-Type"] = "text/markdown"
         response = client.request(url, httpMethod = HttpPut, body = body)
@@ -198,28 +186,25 @@ proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, b
       of HttpDelete:
         response = client.request(url, httpMethod = HttpDelete)
       else:
-        raise newException(ValueError, "Unsupported HTTP method")
+        raise newException(ValueError, t("unsupported_http_method"))
       
-      if response.code == Http404: return "" 
+      if response.code == Http404: 
+        raise newException(NotFoundError, "404 Not Found")
 
       if response.code != Http200 and response.code != Http201 and response.code != Http204:
-        styledEcho(fgRed, "✗ HTTP Error: ", resetStyle, $response.code, " ", response.status)
-        if response.body.len > 0:
-          echo "Response body: ", response.body[0..min(response.body.len-1, 500)]
-        quit(1)
+        let bodyPreview = if response.body.len > 0: response.body[0..min(response.body.len-1, 500)] else: ""
+        raise newException(ServerError, t("http_error", $response.code, response.status) & "\n" & t("response_body", bodyPreview))
       
       return response.body
 
     except HttpRequestError, OSError:
       attempts.inc
       if attempts > MaxRetries:
-        raise
+        raise newException(ServerError, t("network_timeout", $MaxRetries))
       let waitTime = RetryDelayMs * attempts
-      styledEcho(fgYellow, "⚠ Network error, retrying in ", $waitTime, "ms...", resetStyle)
+      withLock consoleLock:
+        styledEcho(fgYellow, "⚠ ", t("retrying", $attempts, $MaxRetries, url), resetStyle)
       sleep(waitTime)
-    except Exception as e:
-      styledEcho(fgRed, "✗ Error: ", resetStyle, e.msg)
-      quit(1)
 
 # --- WORKER PROCS (Native Threads) ---
 
@@ -231,37 +216,34 @@ proc distributeWork[T](data: seq[T], chunks: int): seq[seq[T]] =
 proc backupChunk(args: BackupArgs) {.thread.} =
   let client = newHttpClient(timeout = HttpTimeoutMs)
   client.headers = newHttpHeaders({"X-Sync-Mode": "true", "Accept": "application/json"})
-  if args.conf.authToken != "":
-    client.headers["Authorization"] = "Bearer " & args.conf.authToken
+  if args.conf.authToken != "": client.headers["Authorization"] = "Bearer " & args.conf.authToken
   defer: client.close()
 
   for name in args.files:
     if shuttingDown.load(): return
-
     let pageName = name[0..^4]
     var attempts = 0
     
     while true:
       try:
         let url = args.conf.serverUrl & "/.fs/" & encodeUrl(pageName) & ".md"
-        let content = client.getContent(url) 
+        let response = client.get(url)
+        
+        if response.code == Http404: break 
+        if response.code != Http200:
+          raise newException(CatchableError, i18n.translate("http_error", $args.conf.language, $response.code, ""))
         
         let filePath = args.backupPath / name
         let dir = parentDir(filePath)
-        if dir != "" and not dirExists(dir):
-          createDir(dir)
+        if dir != "" and not dirExists(dir): createDir(dir)
+        writeFile(filePath, response.body)
         
-        writeFile(filePath, content)
-        
-        withLock progressLock:
-          processedCount.inc
-          if not args.verbose and not shuttingDown.load():
-            showProgress(processedCount, globalTotal, "Backup")
+        let current = processedCount.fetchAdd(1) + 1
+        if not args.verbose and not shuttingDown.load():
+          showProgress(current, globalTotal, i18n.translate("backup", $args.conf.language))
         
         if args.verbose:
-          withLock consoleLock:
-            echo "✓ ", name
-        
+          withLock consoleLock: echo "✓ ", name
         break 
 
       except CatchableError as e:
@@ -280,37 +262,31 @@ proc backupChunk(args: BackupArgs) {.thread.} =
 proc restoreChunk(args: RestoreArgs) {.thread.} =
   let client = newHttpClient(timeout = HttpTimeoutMs)
   client.headers = newHttpHeaders({"X-Sync-Mode": "true"})
-  if args.conf.authToken != "":
-    client.headers["Authorization"] = "Bearer " & args.conf.authToken
+  if args.conf.authToken != "": client.headers["Authorization"] = "Bearer " & args.conf.authToken
   defer: client.close()
 
   for file in args.files:
     if shuttingDown.load(): return
-
     var attempts = 0
     while true:
       try:
         let content = readFile(file)
         let relPath = file.replace(args.sourceDir, "").strip(chars = {'/', '\\'})
         var pageName = relPath[0..^4].replace("\\", "/")
-        
-        if args.targetPrefix != "":
-          pageName = args.targetPrefix & "/" & pageName
+        if args.targetPrefix != "": pageName = args.targetPrefix & "/" & pageName
         
         let url = args.conf.serverUrl & "/.fs/" & encodeUrl(pageName) & ".md"
-        
         client.headers["Content-Type"] = "text/markdown"
-        discard client.putContent(url, content)
+        let response = client.request(url, httpMethod = HttpPut, body = content)
+        if response.code != Http200 and response.code != Http201 and response.code != Http204:
+          raise newException(CatchableError, i18n.translate("http_error", $args.conf.language, $response.code, ""))
         
-        withLock progressLock:
-          processedCount.inc
-          if not args.verbose and not shuttingDown.load():
-            showProgress(processedCount, globalTotal, "Restore")
+        let current = processedCount.fetchAdd(1) + 1
+        if not args.verbose and not shuttingDown.load():
+          showProgress(current, globalTotal, i18n.translate("restore", $args.conf.language))
         
         if args.verbose:
-          withLock consoleLock:
-            echo "✓ ", pageName
-        
+          withLock consoleLock: echo "✓ ", pageName
         break 
 
       except CatchableError as e:
@@ -331,65 +307,58 @@ proc restoreChunk(args: RestoreArgs) {.thread.} =
 
 proc listPages(client: HttpClient, showAll = false) =
   let response = makeRequest(client, HttpGet, "/.fs")
-  try:
-    let data = parseJson(response)
-    echo "\n📄 ", t("pages_in_sb"), "\n", "─".repeat(SeparatorLength)
-    var pages: seq[tuple[name: string, lastModified: int]] = @[]
-    for item in data:
-      if item.kind == JObject:
-        let name = item["name"].getStr()
-        if name.endsWith(".md"):
-          let pageName = name[0..^4]
-          if shouldIncludePage(pageName, showAll):
-            pages.add((name: pageName, lastModified: item{"lastModified"}.getInt(0)))
-    pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int =
-      cmp(b.lastModified, a.lastModified))
-    let numWidth = max(2, ($pages.len).len)
-    for i, page in pages:
-      let numStr = formatWithLeadingZeros(i+1, numWidth)
-      if page.lastModified > 0:
-        let timeStr = fromUnix(page.lastModified div 1000).format("dd.MM.yyyy HH:mm")
-        stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
-        stdout.styledWrite(fgWhite, page.name, " ")
-        stdout.styledWriteLine(fgYellow, "(", timeStr, ")")
-      else:
-        stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
-        stdout.styledWriteLine(fgWhite, page.name)
-    echo "─".repeat(SeparatorLength)
-    let label = if showAll: t("all") else: t("without_system")
-    echo t("total"), ": ", pages.len, " ", t("pages"), " (", label, ")"
-  except JsonParsingError as e:
-    styledEcho(fgRed, "✗ JSON Parse Error: ", resetStyle, e.msg)
-    quit(1)
+  let data = parseJson(response)
+  echo "\n📄 ", t("pages_in_sb"), "\n", "─".repeat(SeparatorLength)
+  var pages: seq[tuple[name: string, lastModified: int]] = @[]
+  for item in data:
+    if item.kind == JObject:
+      let name = item["name"].getStr()
+      if name.endsWith(".md"):
+        let pageName = name[0..^4]
+        if shouldIncludePage(pageName, showAll):
+          pages.add((name: pageName, lastModified: item{"lastModified"}.getInt(0)))
+  pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int = cmp(b.lastModified, a.lastModified))
+  let numWidth = max(2, ($pages.len).len)
+  for i, page in pages:
+    let numStr = formatWithLeadingZeros(i+1, numWidth)
+    if page.lastModified > 0:
+      let timeStr = fromUnix(page.lastModified div 1000).format("dd.MM.yyyy HH:mm")
+      stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
+      stdout.styledWrite(fgWhite, page.name, " ")
+      stdout.styledWriteLine(fgYellow, "(", timeStr, ")")
+    else:
+      stdout.styledWrite(fgCyan, numStr, ". ", resetStyle)
+      stdout.styledWriteLine(fgWhite, page.name)
+  echo "─".repeat(SeparatorLength)
+  let label = if showAll: t("all") else: t("without_system")
+  echo t("total"), ": ", pages.len, " ", t("pages"), " (", label, ")"
 
 proc getPage(client: HttpClient, pageName: string) =
-  if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
-    quit(1)
-  echo makeRequest(client, HttpGet, getPageEndpoint(pageName))
+  ensureValidPageName(pageName)
+  try:
+    echo makeRequest(client, HttpGet, getPageEndpoint(pageName))
+  except NotFoundError:
+    raise newException(NotFoundError, t("page_does_not_exist_error", pageName))
 
 proc appendToPage(client: HttpClient, pageName: string, content: string) =
-  if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
-    quit(1)
+  ensureValidPageName(pageName)
   var currentContent = ""
   try:
     currentContent = makeRequest(client, HttpGet, getPageEndpoint(pageName))
-  except CatchableError:
+  except NotFoundError:
     styledEcho(fgYellow, "ℹ ", resetStyle, t("page_not_exist", pageName))
+    
   var newContent = currentContent
   if currentContent.len > 0 and not currentContent.endsWith("\n"):
     newContent.add(PageContentSeparator)
   newContent.add(content)
-  if not newContent.endsWith("\n"):
-    newContent.add("\n")
+  if not newContent.endsWith("\n"): newContent.add("\n")
+    
   discard makeRequest(client, HttpPut, getPageEndpoint(pageName), newContent)
   styledEcho(fgGreen, "✓ ", resetStyle, t("text_appended", pageName))
 
 proc deletePage(client: HttpClient, pageName: string, force = false) =
-  if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
-    quit(1)
+  ensureValidPageName(pageName)
   if not force:
     stdout.styledWrite(fgYellow, "⚠ ", resetStyle, t("confirm_delete", pageName))
     stdout.flushFile()
@@ -398,10 +367,14 @@ proc deletePage(client: HttpClient, pageName: string, force = false) =
     if answer notin confirmChars:
       echo t("aborted")
       return
-  discard makeRequest(client, HttpDelete, getPageEndpoint(pageName))
-  styledEcho(fgRed, "✗ ", resetStyle, t("page_deleted", pageName))
+  try:
+    discard makeRequest(client, HttpDelete, getPageEndpoint(pageName))
+    styledEcho(fgYellow, "🗑 ", resetStyle, t("page_deleted", pageName))
+  except NotFoundError:
+    raise newException(NotFoundError, t("page_does_not_exist_error", pageName))
 
 proc searchPages(client: HttpClient, query: string) =
+  let q = query.toLower() # Performance Boost!
   let response = makeRequest(client, HttpGet, "/.fs")
   let data = parseJson(response)
   echo "\n🔍 ", t("search_for", query)
@@ -412,13 +385,15 @@ proc searchPages(client: HttpClient, query: string) =
       let name = item["name"].getStr()
       if name.endsWith(".md"):
         let pageName = name[0..^4]
-        if query.toLower() in pageName.toLower():
+        let pageNameLower = pageName.toLower()
+        
+        if q in pageNameLower:
           found.inc
           styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgYellow, t("in_title"))
           continue
         
-        let dist = editDistance(query.toLower(), pageName.toLower())
-        let threshold = if query.len < 4: 1 else: 3
+        let dist = editDistance(q, pageNameLower)
+        let threshold = if q.len < 4: 1 else: 3
         if dist <= threshold:
            found.inc
            styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgMagenta, "(fuzzy match)")
@@ -426,17 +401,16 @@ proc searchPages(client: HttpClient, query: string) =
 
         try:
           let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
-          if query.toLower() in content.toLower():
+          if q in content.toLower():
             found.inc
             styledEcho(fgCyan, "• ", resetStyle, pageName)
             for line in content.splitLines():
-              if query.toLower() in line.toLower():
+              if q in line.toLower():
                 let trimmed = line.strip()
                 if trimmed.len > 0:
                   echo "  ", trimmed[0..min(trimmed.len-1, MaxSnippetLength)]
-            break
-        except HttpRequestError, OSError:
-          discard
+                  break # FIX: Bricht nun korrekt ab!
+        except NotFoundError: discard
   echo "─".repeat(SeparatorLength)
   echo t("found"), ": ", found, " ", t("pages")
 
@@ -452,8 +426,7 @@ proc showRecent(client: HttpClient, limit = DefaultRecentLimit, showAll = false)
         let pageName = name[0..^4]
         if shouldIncludePage(pageName, showAll):
           pages.add((name: pageName, lastModified: item{"lastModified"}.getInt(0)))
-  pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int =
-    cmp(b.lastModified, a.lastModified))
+  pages.sort(proc(a, b: tuple[name: string, lastModified: int]): int = cmp(b.lastModified, a.lastModified))
   let numWidth = max(2, ($min(limit, pages.len)).len)
   for i in 0..<min(limit, pages.len):
     let numStr = formatWithLeadingZeros(i+1, numWidth)
@@ -469,13 +442,17 @@ proc showRecent(client: HttpClient, limit = DefaultRecentLimit, showAll = false)
   let label = if showAll: t("all") else: t("without_system")
   echo t("showing"), " ", min(limit, pages.len), " ", t("of"), " ", pages.len, " ", t("pages"), " (", label, ")"
 
-proc backupPages(client: HttpClient, targetDir = "", fullBackup = false, verbose = false) =
+proc backupPages(targetDir = "", fullBackup = false, verbose = false) =
   let timestamp = now().format("ddMMyyyy-HHmmss")
   let backupPath = if targetDir != "": targetDir else: getCurrentDir() / "backup-" & timestamp
   echo "\n💾 ", t("creating_backup")
   echo t("target_dir"), ": ", backupPath
   createDir(backupPath)
+  
+  let client = createClient()
   let response = makeRequest(client, HttpGet, "/.fs")
+  client.close()
+  
   let data = parseJson(response)
   var filesToBackup: seq[string] = @[]
   for item in data:
@@ -485,24 +462,23 @@ proc backupPages(client: HttpClient, targetDir = "", fullBackup = false, verbose
         let pageName = name[0..^4]
         if fullBackup or not isSystemPage(pageName):
           filesToBackup.add(name)
+          
   globalTotal = filesToBackup.len
-  processedCount = 0
+  processedCount.store(0)
   echo "─".repeat(SeparatorLength)
   echo t("total"), ": ", globalTotal, " ", t("files")
   
   if globalTotal == 0:
-    echo "Nichts zu tun."
+    echo t("nothing_to_do")
     return
   
   let numThreads = countProcessors()
   let chunks = distributeWork(filesToBackup, numThreads)
   
-  # 1. Zähle genau, wie viele Threads wir wirklich brauchen
   var activeChunks = 0
   for chunk in chunks:
     if chunk.len > 0: activeChunks.inc
   
-  # 2. Erstelle die Seq in exakt dieser Größe
   var threads = newSeq[Thread[BackupArgs]](activeChunks)
   var threadIdx = 0
   
@@ -511,43 +487,34 @@ proc backupPages(client: HttpClient, targetDir = "", fullBackup = false, verbose
       createThread(threads[threadIdx], backupChunk, (chunk, backupPath, config, verbose))
       threadIdx.inc
       
-  # 3. Warte auf alle Threads (ohne Slicing/Kopieren!)
-  if threads.len > 0:
-    joinThreads(threads)
+  if threads.len > 0: joinThreads(threads)
 
   echo ""
   echo "─".repeat(SeparatorLength)
-  if shuttingDown.load():
-    styledEcho(fgYellow, "🛑 ", t("operation_aborted"), resetStyle)
-  else:
-    styledEcho(fgGreen, "✓ ", resetStyle, t("backup_success", backupPath))
+  if shuttingDown.load(): styledEcho(fgYellow, "🛑 ", t("operation_aborted"), resetStyle)
+  else: styledEcho(fgGreen, "✓ ", resetStyle, t("backup_success", backupPath))
 
-proc restorePages(client: HttpClient, sourceDir: string, targetPrefix = "", verbose = false) =
+proc restorePages(sourceDir: string, targetPrefix = "", verbose = false) =
   if not dirExists(sourceDir):
-    styledEcho(fgRed, "✗ ", resetStyle, t("backup_dir_not_found"), ": ", sourceDir)
-    quit(1)
+    raise newException(ValueError, t("backup_dir_not_found") & ": " & sourceDir)
   echo "\n📦 ", t("restoring_backup")
   var filesToRestore: seq[string] = @[]
   for file in walkDirRec(sourceDir):
-    if file.endsWith(".md"):
-      filesToRestore.add(file)
+    if file.endsWith(".md"): filesToRestore.add(file)
   globalTotal = filesToRestore.len
-  processedCount = 0
+  processedCount.store(0)
   echo "─".repeat(SeparatorLength)
   echo t("total"), ": ", globalTotal, " ", t("files")
   
-  if globalTotal == 0:
-    return
+  if globalTotal == 0: return
   
   let numThreads = countProcessors()
   let chunks = distributeWork(filesToRestore, numThreads)
   
-  # 1. Zähle genau, wie viele Threads wir wirklich brauchen
   var activeChunks = 0
   for chunk in chunks:
     if chunk.len > 0: activeChunks.inc
   
-  # 2. Erstelle die Seq in exakt dieser Größe
   var threads = newSeq[Thread[RestoreArgs]](activeChunks)
   var threadIdx = 0
   
@@ -556,62 +523,45 @@ proc restorePages(client: HttpClient, sourceDir: string, targetPrefix = "", verb
       createThread(threads[threadIdx], restoreChunk, (chunk, sourceDir, targetPrefix, config, verbose))
       threadIdx.inc
       
-  # 3. Warte auf alle Threads (ohne Slicing/Kopieren!)
-  if threads.len > 0:
-    joinThreads(threads)
+  if threads.len > 0: joinThreads(threads)
 
   echo ""
   echo "─".repeat(SeparatorLength)
-  if shuttingDown.load():
-    styledEcho(fgYellow, "🛑 ", t("operation_aborted"), resetStyle)
-  else:
-    styledEcho(fgGreen, "✓ ", resetStyle, t("restore_success"))
+  if shuttingDown.load(): styledEcho(fgYellow, "🛑 ", t("operation_aborted"), resetStyle)
+  else: styledEcho(fgGreen, "✓ ", resetStyle, t("restore_success"))
 
 proc downloadPage(client: HttpClient, pageName: string, outputFile = "") =
-  if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
-    quit(1)
+  ensureValidPageName(pageName)
   echo "\n📥 ", t("downloading_page")
   try:
     let content = makeRequest(client, HttpGet, getPageEndpoint(pageName))
-    
     if content.len == 0:
-       styledEcho(fgYellow, "⚠ ", resetStyle, "Page content is empty or not found.")
+       styledEcho(fgYellow, "⚠ ", resetStyle, t("page_content_empty"))
    
     let filename = if outputFile != "": outputFile else: pageName.replace('/', DirSep) & ".md"
-    
     let dir = parentDir(filename)
-    if dir != "" and not dirExists(dir):
-      createDir(dir)
-    
+    if dir != "" and not dirExists(dir): createDir(dir)
     writeFile(filename, content)
     
     styledEcho(fgGreen, "✓ ", resetStyle, t("downloaded"), ": ", pageName)
     echo t("saved_as"), ": ", filename
     echo t("size"), ": ", content.len, " ", t("bytes")
-  except CatchableError as e:
-    styledEcho(fgRed, "✗ ", resetStyle, t("download_error"), ": ", e.msg)
-    quit(1)
+  except NotFoundError:
+    raise newException(NotFoundError, t("page_does_not_exist_error", pageName))
 
 proc uploadPage(client: HttpClient, sourceFile: string, pageName: string) =
-  if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
-    quit(1)
+  ensureValidPageName(pageName)
   echo "\n📤 ", t("uploading_file")
   if not fileExists(sourceFile):
-    styledEcho(fgRed, "✗ ", resetStyle, t("file_not_found"), ": ", sourceFile)
-    quit(1)
-  try:
-    let content = readFile(sourceFile)
-    let cleanPageName = pageName.replace('\\', '/')
-    discard makeRequest(client, HttpPut, getPageEndpoint(cleanPageName), content)
+    raise newException(ValueError, t("file_not_found") & ": " & sourceFile)
     
-    styledEcho(fgGreen, "✓ ", resetStyle, t("uploaded"), ": ", sourceFile)
-    echo t("as_page"), ": ", cleanPageName
-    echo t("size"), ": ", content.len, " ", t("bytes")
-  except CatchableError as e:
-    styledEcho(fgRed, "✗ ", resetStyle, t("upload_error"), ": ", e.msg)
-    quit(1)
+  let content = readFile(sourceFile)
+  let cleanPageName = pageName.replace('\\', '/')
+  discard makeRequest(client, HttpPut, getPageEndpoint(cleanPageName), content)
+  
+  styledEcho(fgGreen, "✓ ", resetStyle, t("uploaded"), ": ", sourceFile)
+  echo t("as_page"), ": ", cleanPageName
+  echo t("size"), ": ", content.len, " ", t("bytes")
 
 proc extractLinks(content: string): seq[string] =
   var links: seq[string] = @[]
@@ -619,20 +569,16 @@ proc extractLinks(content: string): seq[string] =
   for match in content.findAll(pattern):
     let inner = match[2..^3]
     var linkName = if "|" in inner: inner.split("|")[0].strip() else: inner.strip()
-    
-    # Anker-Links abschneiden
     let hashPos = linkName.find('#')
-    if hashPos >= 0:
-      linkName = linkName[0 ..< hashPos].strip()
-      
-    if linkName != "":
-      links.add(linkName)
+    if hashPos >= 0: linkName = linkName[0 ..< hashPos].strip()
+    if linkName != "": links.add(linkName)
   return links
 
 proc showGraph(client: HttpClient, format = "text", showAll = false) =
   if format.toLower() == "text":
     echo "\n🔗 ", t("analyzing_links")
     echo "─".repeat(SeparatorLength)
+  
   let response = makeRequest(client, HttpGet, "/.fs")
   let data = parseJson(response)
   var graph: Table[string, seq[string]]
@@ -643,8 +589,7 @@ proc showGraph(client: HttpClient, format = "text", showAll = false) =
       let name = item["name"].getStr()
       if name.endsWith(".md"):
         let pageName = name[0..^4]
-        if not shouldIncludePage(pageName, showAll):
-          continue
+        if not shouldIncludePage(pageName, showAll): continue
         allPages.incl(pageName)
         incomingCounts[pageName] = 0
         try:
@@ -652,10 +597,9 @@ proc showGraph(client: HttpClient, format = "text", showAll = false) =
           let links = extractLinks(content)
           graph[pageName] = links
           for link in links:
-            if link notin incomingCounts:
-              incomingCounts[link] = 0
+            if link notin incomingCounts: incomingCounts[link] = 0
             incomingCounts[link] += 1
-        except HttpRequestError, OSError:
+        except CatchableError:
           graph[pageName] = @[]
   case format.toLower()
   of "dot", "graphviz":
@@ -672,8 +616,7 @@ proc showGraph(client: HttpClient, format = "text", showAll = false) =
     for page in allPages:
       let outgoing = if page in graph: graph[page].len else: 0
       let incoming = incomingCounts.getOrDefault(page, 0)
-      if outgoing == 0 and incoming == 0:
-        isolatedPages.add(page)
+      if outgoing == 0 and incoming == 0: isolatedPages.add(page)
       elif outgoing > 0:
         echo "\n📄 ", page
         echo "  → ", outgoing, " ", t("outgoing_links"), ":"
@@ -688,8 +631,7 @@ proc showGraph(client: HttpClient, format = "text", showAll = false) =
           echo "  ← ", incoming, " ", t("incoming_links")
     if isolatedPages.len > 0:
       echo "\n🔷 ", t("isolated_pages"), ":"
-      for page in isolatedPages:
-        echo "  • ", page
+      for page in isolatedPages: echo "  • ", page
     echo "\n─".repeat(SeparatorLength)
     echo t("pages"), ": ", allPages.len
     echo t("connections"), ": ", totalLinks
@@ -699,80 +641,62 @@ proc showGraph(client: HttpClient, format = "text", showAll = false) =
 
 proc checkPageExists(client: HttpClient, pageName: string): bool =
   try:
-    let url = config.serverUrl & getPageEndpoint(pageName)
-    let resp = client.get(url)
-    return resp.code == Http200
-  except CatchableError:
+    discard makeRequest(client, HttpGet, getPageEndpoint(pageName))
+    return true
+  except NotFoundError:
     return false
+  # Alle echten Fehler (Netzwerkabbruch, 500 Server Error) fliegen 
+  # jetzt sauber nach oben zur main() und beenden das Programm sicher!
 
 proc createPage(client: HttpClient, pageName: string, content: string) =
-  if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
-    quit(1)
+  ensureValidPageName(pageName)
   if checkPageExists(client, pageName):
-    styledEcho(fgRed, "✗ ", t("page_exists_error", pageName), resetStyle)
-    echo t("use_edit_hint")
-    return
+    raise newException(ValueError, t("page_exists_error", pageName) & "\n" & t("use_edit_hint"))
   discard makeRequest(client, HttpPut, getPageEndpoint(pageName), content)
   styledEcho(fgGreen, "✓ ", resetStyle, t("page_created", pageName))
 
 proc editPage(client: HttpClient, pageName: string, content: string) =
-  if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
-    quit(1)
+  ensureValidPageName(pageName)
   if not checkPageExists(client, pageName):
-    styledEcho(fgRed, "✗ ", t("page_does_not_exist_error", pageName), resetStyle)
-    echo t("use_create_hint")
-    return
+    raise newException(NotFoundError, t("page_does_not_exist_error", pageName) & "\n" & t("use_create_hint"))
   discard makeRequest(client, HttpPut, getPageEndpoint(pageName), content)
   styledEcho(fgGreen, "✓ ", resetStyle, t("page_updated", pageName))
 
+proc buildEditorCommand(editor, tempFile: string): string =
+  if editor.len == 0:
+    when defined(windows): return "notepad " & quoteShell(tempFile)
+    else: return "nano " & quoteShell(tempFile)
+  
+  if fileExists(editor):
+    return quoteShell(editor) & " " & quoteShell(tempFile)
+
+  return editor & " " & quoteShell(tempFile)
+
 proc openEditor(client: HttpClient, pageName: string) =
-  if not validatePageName(pageName):
-    styledEcho(fgRed, "✗ ", resetStyle, t("invalid_pagename"))
-    quit(1)
+  ensureValidPageName(pageName)
   echo "📥 ", t("fetching_page", pageName)
   var currentContent = ""
   try:
-    let url = config.serverUrl & getPageEndpoint(pageName)
-    let resp = client.get(url)
-    if resp.code == Http404:
-       styledEcho(fgYellow, "ℹ ", t("new_draft_msg"), resetStyle)
-    elif resp.code == Http200:
-      currentContent = resp.body
-    else:
-      styledEcho(fgRed, "✗ ", t("fetch_error_code", $resp.code), resetStyle)
-      quit(1)
-  except CatchableError as e:
-    if "404" in e.msg:
-       styledEcho(fgYellow, "ℹ ", t("new_draft_msg"), resetStyle)
-    else:
-       styledEcho(fgRed, "✗ Error: ", e.msg)
-       quit(1)
+    currentContent = makeRequest(client, HttpGet, getPageEndpoint(pageName))
+  except NotFoundError:
+    styledEcho(fgYellow, "ℹ ", t("new_draft_msg"), resetStyle)
 
   let tempDir = getTempDir()
   let tempFile = tempDir / ("sb_edit_" & pageName.replace("/", "_") & ".md")
   writeFile(tempFile, currentContent)
   
-  # Garantiert das Löschen der Datei beim Verlassen der Funktion
   defer: 
-    if fileExists(tempFile):
-      removeFile(tempFile)
+    if fileExists(tempFile): removeFile(tempFile)
   
   var editor = getEnv("EDITOR")
-  if editor == "":
-    when defined(windows): editor = "notepad"
-    else: editor = "nano"
-  
-  echo "📝 ", t("opening_editor", editor)
-  let exitCode = execShellCmd(editor & " " & quoteShell(tempFile))
-  
+  let cmd = buildEditorCommand(editor, tempFile)
+  echo "📝 ", t("opening_editor", if editor.len > 0: editor else: (when defined(windows): "notepad" else: "nano"))
+    
+  let exitCode = execShellCmd(cmd)
   if exitCode != 0:
-    styledEcho(fgRed, "✗ ", t("editor_error", $exitCode), resetStyle)
-    return
+    raise newException(ValueError, t("editor_error", $exitCode))
 
   let newContent = readFile(tempFile)
-
   if newContent == currentContent:
     echo "🤔 ", t("no_changes")
     return
@@ -877,11 +801,15 @@ CONFIGURATION:
 
 proc main() =
   initLock(consoleLock)
-  initLock(progressLock)
   setControlCHook(ctrlCHandler)
   
   var opts = CliOptions(configFile: getConfigDir() / "silverbullet-cli" / "config.json", verbose: false, force: false, showAll: false, fullBackup: false, targetPrefix: "", command: "", args: @[])
-  var p = initOptParser(shortNoVal = {'a', 'f', 'v'}, longNoVal = @["all", "force", "verbose", "full"])
+  
+  var p = initOptParser(shortNoVal = {'a', 'f', 'v', 'h'}, longNoVal = @["all", "force", "verbose", "full", "help", "version", "ver"])
+  
+  var wantsHelp = false
+  var wantsVersion = false
+
   for kind, key, val in p.getopt():
     case kind
     of cmdArgument:
@@ -894,106 +822,119 @@ proc main() =
       of "verbose", "v": opts.verbose = true
       of "force", "f": opts.force = true
       of "to":         opts.targetPrefix = val
-      of "help", "h":  showHelp(); return
-      of "version", "ver": echo AppName, " v", Version; return
-      else: echo t("unknown_option", key)
-    of cmdEnd: assert(false)
+      of "help", "h":  wantsHelp = true
+      of "version", "ver": wantsVersion = true
+      else: discard
+    of cmdEnd: break # FIX: Sauberer Ausstieg statt assert(false)
 
   configFile = opts.configFile
   loadConfig()
   
-  if opts.command == "":
-    echo AppName, " v", Version
-    echo "Use 'sb help' for commands."
-    return
-
-  if opts.command in ["help", "h"]:
+  if wantsHelp or opts.command in ["help", "h"]:
     showHelp()
     return
 
-  if opts.command in ["version", "ver"]: echo AppName, " v", Version; return
-  
-  if opts.command == "config":
-    if opts.args.len < 1: echo t("error_url_required"); return
-    configureServer(opts.args[0], if opts.args.len >= 2: opts.args[1] else: ""); return
-  
-  if opts.command in ["lang", "language"]:
-    if opts.args.len < 1: echo "Error: Language required"; return
-    setLanguage(opts.args[0]); return
+  if wantsVersion or opts.command in ["version", "ver"]: 
+    echo AppName, " v", Version
+    return
 
-  if config.serverUrl == "":
-      styledEcho(fgRed, "✗ ", resetStyle, t("error_no_url")); quit(1)
+  if opts.command == "":
+    echo AppName, " v", Version
+    echo t("use_help_for_commands")
+    return
   
-  let client = createClient(); defer: client.close()
+  # --- ZENTRALES ERROR HANDLING ---
+  try:
+    case opts.command
+    of "config":
+      if opts.args.len < 1: raise newException(ValueError, t("error_url_required"))
+      configureServer(opts.args[0], if opts.args.len >= 2: opts.args[1] else: "")
+    of "lang", "language":
+      if opts.args.len < 1: raise newException(ValueError, t("error_language_required"))
+      setLanguage(opts.args[0])
+    else:
+      if config.serverUrl == "":
+        raise newException(ValueError, t("error_no_url"))
+      
+      let client = createClient(); defer: client.close()
 
-  case opts.command
-  of "list", "ls":
-    listPages(client, opts.showAll)
-  of "get", "show", "cat":
-    if opts.args.len < 1: echo t("error_pagename_required"); return
-    getPage(client, opts.args[0])
-  
-  of "create", "new":
-    if opts.args.len < 1: echo t("error_pagename_required"); return
-    let content = if opts.args.len >= 2: opts.args[1..^1].join(" ") else: readFromStdin()
-    if content.len == 0: echo t("error_no_content"); return
-    createPage(client, opts.args[0], content)
-
-  of "edit", "update":
-    if opts.args.len < 1: echo t("error_pagename_required"); return
-    
-    if opts.args.len >= 2:
-      let content = opts.args[1..^1].join(" ")
-      editPage(client, opts.args[0], content)
-    elif not isatty(stdin):
-      let content = readFromStdin()
-      if content.len > 0:
-        editPage(client, opts.args[0], content)
+      case opts.command
+      of "list", "ls":
+        listPages(client, opts.showAll)
+      of "get", "show", "cat":
+        if opts.args.len < 1: raise newException(ValueError, t("error_pagename_required"))
+        getPage(client, opts.args[0])
+      of "create", "new":
+        if opts.args.len < 1: raise newException(ValueError, t("error_pagename_required"))
+        let content = if opts.args.len >= 2: opts.args[1..^1].join(" ") else: readFromStdin()
+        if content.len == 0: raise newException(ValueError, t("error_no_content"))
+        createPage(client, opts.args[0], content)
+      of "edit", "update":
+        if opts.args.len < 1: raise newException(ValueError, t("error_pagename_required"))
+        if opts.args.len >= 2:
+          editPage(client, opts.args[0], opts.args[1..^1].join(" "))
+        elif not isatty(stdin):
+          let content = readFromStdin()
+          if content.len > 0: editPage(client, opts.args[0], content)
+          else: openEditor(client, opts.args[0])
+        else:
+          openEditor(client, opts.args[0])
+      of "append", "add":
+        if opts.args.len < 1: raise newException(ValueError, t("error_pagename_required"))
+        let content = if opts.args.len >= 2: opts.args[1..^1].join(" ") else: readFromStdin()
+        if content.len == 0: raise newException(ValueError, t("error_no_content"))
+        appendToPage(client, opts.args[0], content)
+      of "delete", "rm", "del":
+        if opts.args.len < 1: raise newException(ValueError, t("error_pagename_required"))
+        deletePage(client, opts.args[0], opts.force)
+      of "search", "find":
+        if opts.args.len < 1: raise newException(ValueError, t("error_query_required"))
+        searchPages(client, opts.args[0])
+      of "recent":
+        showRecent(client, DefaultRecentLimit, opts.showAll)
+      of "backup":
+        backupPages(if opts.args.len >= 1: opts.args[0] else: "", opts.fullBackup, opts.verbose)
+      of "restore":
+        if opts.args.len < 1: raise newException(ValueError, t("error_backup_dir_required"))
+        restorePages(opts.args[0], opts.targetPrefix, opts.verbose)
+      of "download", "dl":
+        if opts.args.len < 1: raise newException(ValueError, t("error_pagename_required"))
+        downloadPage(client, opts.args[0], if opts.args.len >= 2: opts.args[1] else: "")
+      of "upload", "ul":
+        if opts.args.len < 2: raise newException(ValueError, t("error_file_and_page_required"))
+        uploadPage(client, opts.args[0], opts.args[1])
+      of "graph":
+        showGraph(client, if opts.args.len >= 1: opts.args[0] else: "text", opts.showAll)
       else:
-        openEditor(client, opts.args[0])
-    else:
-      openEditor(client, opts.args[0])
+        var bestMatch = ""
+        var bestDist = 100
+        for valid in ValidCommands:
+          let dist = editDistance(opts.command, valid)
+          if dist < bestDist: 
+            bestDist = dist
+            bestMatch = valid
+        if bestDist <= 2:
+          styledEcho(fgYellow, "💡 ", t("did_you_mean", bestMatch), resetStyle)
+        else:
+          styledEcho(fgRed, "✗ ", resetStyle, t("error_unknown_command"), ": ", opts.command)
+          echo t("use_help_for_commands")
+        quit(1)
 
-  of "append", "add":
-    if opts.args.len < 1: echo t("error_pagename_required"); return
-    let content = if opts.args.len >= 2: opts.args[1..^1].join(" ") else: readFromStdin()
-    if content.len == 0: echo t("error_no_content"); return
-    appendToPage(client, opts.args[0], content)
-  of "delete", "rm", "del":
-    if opts.args.len < 1: echo t("error_pagename_required"); return
-    deletePage(client, opts.args[0], opts.force)
-  of "search", "find":
-    if opts.args.len < 1: echo t("error_query_required"); return
-    searchPages(client, opts.args[0])
-  of "recent":
-    showRecent(client, DefaultRecentLimit, opts.showAll)
-  of "backup":
-    backupPages(client, if opts.args.len >= 1: opts.args[0] else: "", opts.fullBackup, opts.verbose)
-  of "restore":
-    if opts.args.len < 1: echo t("error_backup_dir_required"); return
-    restorePages(client, opts.args[0], opts.targetPrefix, opts.verbose)
-  of "download", "dl":
-    if opts.args.len < 1: echo t("error_pagename_required"); return
-    downloadPage(client, opts.args[0], if opts.args.len >= 2: opts.args[1] else: "")
-  of "upload", "ul":
-    if opts.args.len < 2: echo t("error_file_and_page_required"); return
-    uploadPage(client, opts.args[0], opts.args[1])
-  of "graph":
-    showGraph(client, if opts.args.len >= 1: opts.args[0] else: "text", opts.showAll)
-  else:
-    echo t("error_unknown_command"), ": ", opts.command
-    var bestMatch = ""
-    var bestDist = 100
-    for valid in ValidCommands:
-      let dist = editDistance(opts.command, valid)
-      if dist < bestDist: 
-        bestDist = dist
-        bestMatch = valid
-    if bestDist <= 2:
-      let msg = if config.language == langDE: "Meintest du '$1'?" else: "Did you mean '$1'?"
-      styledEcho(fgYellow, "💡 ", msg % bestMatch, resetStyle)
-    else:
-      echo t("error_use_help")
+  except NotFoundError as e:
+    styledEcho(fgRed, "✗ ", resetStyle, e.msg)
+    quit(1)
+  except ServerError as e:
+    styledEcho(fgRed, "✗ ", resetStyle, e.msg)
+    quit(1)
+  except ValueError as e:
+    styledEcho(fgRed, "✗ ", resetStyle, e.msg)
+    quit(1)
+  except JsonParsingError as e:
+    styledEcho(fgRed, "✗ ", resetStyle, t("json_parse_error", e.msg))
+    quit(1)
+  except CatchableError as e:
+    styledEcho(fgRed, "✗ ", resetStyle, t("general_error", e.msg))
+    quit(1)
 
 when isMainModule:
   main()

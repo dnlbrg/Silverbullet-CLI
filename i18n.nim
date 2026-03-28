@@ -5,7 +5,6 @@ type
     langDE = "de"
     langEN = "en"
 
-# Konstante Arrays anstelle von dynamischen Tables (100% GC-safe & Thread-safe)
 const deTranslations = [
   ("config_saved", "Konfiguration gespeichert"),
   ("server", "Server"),
@@ -18,6 +17,8 @@ const deTranslations = [
   ("of", "von"),
   ("found", "Gefunden"),
   ("backed_up", "Gesichert"),
+  ("backup", "Backup"),
+  ("restore", "Wiederherstellen"),
   ("files", "Dateien"),
   ("skipped", "Übersprungen"),
   ("system_files", "System-Dateien (verwende --full für komplettes Backup)"),
@@ -94,7 +95,19 @@ const deTranslations = [
   ("fetch_error_code", "Fehler beim Abrufen der Seite: $1"),
   ("ctrl_c_pressed", "Abbruch signalisiert... beende laufende Aufgaben."),
   ("operation_aborted", "Vorgang durch Benutzer abgebrochen."),
-  ("retrying", "Fehler (Versuch $1/$2): $3")
+  ("retrying", "Fehler (Versuch $1/$2): $3"),
+  ("unknown_language", "Unbekannte Sprache. Verwende: de oder en"),
+  ("error_language_required", "Fehler: Sprache erforderlich"),
+  ("did_you_mean", "Meintest du '$1'?"),
+  ("json_parse_error", "JSON Parse Fehler: $1"),
+  ("http_error", "HTTP Fehler $1: $2"),
+  ("response_body", "Antwort (Body): $1"),
+  ("unsupported_http_method", "Nicht unterstützte HTTP-Methode"),
+  ("page_content_empty", "Seiteninhalt ist leer."),
+  ("nothing_to_do", "Nichts zu tun."),
+  ("use_help_for_commands", "Verwende 'sb help' für Befehle."),
+  ("network_timeout", "Netzwerk-Timeout nach $1 Versuchen."),
+  ("general_error", "Fehler: $1")
 ]
 
 const enTranslations = [
@@ -109,6 +122,8 @@ const enTranslations = [
   ("of", "of"),
   ("found", "Found"),
   ("backed_up", "Backed up"),
+  ("backup", "Backup"),
+  ("restore", "Restore"),
   ("files", "files"),
   ("skipped", "Skipped"),
   ("system_files", "system files (use --full for complete backup)"),
@@ -185,10 +200,21 @@ const enTranslations = [
   ("fetch_error_code", "Error fetching page: $1"),
   ("ctrl_c_pressed", "Abort signal received... finishing active tasks."),
   ("operation_aborted", "Operation aborted by user."),
-  ("retrying", "Error (Try $1/$2): $3")
+  ("retrying", "Error (Try $1/$2): $3"),
+  ("unknown_language", "Unknown language. Use: de or en"),
+  ("error_language_required", "Error: Language required"),
+  ("did_you_mean", "Did you mean '$1'?"),
+  ("json_parse_error", "JSON Parse Error: $1"),
+  ("http_error", "HTTP Error $1: $2"),
+  ("response_body", "Response body: $1"),
+  ("unsupported_http_method", "Unsupported HTTP method"),
+  ("page_content_empty", "Page content is empty."),
+  ("nothing_to_do", "Nothing to do."),
+  ("use_help_for_commands", "Use 'sb help' for commands."),
+  ("network_timeout", "Network timeout after $1 attempts."),
+  ("general_error", "Error: $1")
 ]
 
-# NEUER NAME: translate
 proc translate*(key: string, lang: string, args: varargs[string]): string =
   result = key 
   
