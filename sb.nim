@@ -1,6 +1,5 @@
-
-import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re, sets, tables, parseopt]
-import std/[threadpool, locks, cpuinfo, editdistance]
+import std/[httpclient, json, os, strutils, terminal, times, uri, algorithm, re, sets, tables, parseopt, atomics]
+import std/[locks, cpuinfo, editdistance] # threadpool wurde hier entfernt
 import i18n
 
 const
@@ -14,7 +13,7 @@ const
   PageContentSeparator = "\n"
   
   MaxRetries = 3
-  RetryDelayMs = 500 # Start-Verzögerung (wird erhöht bei Retries)
+  RetryDelayMs = 500
 
   ValidCommands = ["config", "lang", "list", "ls", "get", "show", "cat", "create", "new", 
                    "edit", "update", "append", "add", "delete", "rm", "del", "search", "find", 
@@ -37,6 +36,20 @@ type
     command: string
     args: seq[string]
 
+  # Typen für die neuen Native Threads
+  BackupArgs = tuple
+    files: seq[string]
+    backupPath: string
+    conf: Config
+    verbose: bool
+
+  RestoreArgs = tuple
+    files: seq[string]
+    sourceDir: string
+    targetPrefix: string
+    conf: Config
+    verbose: bool
+
 # Globale Variablen
 var config: Config
 var configFile = getConfigDir() / "silverbullet-cli" / "config.json"
@@ -46,19 +59,18 @@ var consoleLock: Lock
 var progressLock: Lock
 var processedCount: int
 var globalTotal: int
-# Volatile sorgt dafür, dass alle Threads die Änderung sofort sehen
-var shuttingDown {.volatile.}: bool = false 
+
+# Atomic statt volatile für Thread-Sicherheit
+var shuttingDown: Atomic[bool]
+shuttingDown.store(false)
 
 proc t(key: string, args: varargs[string]): string =
-  i18n.t(key, $config.language, args)
+  i18n.translate(key, $config.language, args)
 
 # --- STRG+C HANDLER ---
 proc ctrlCHandler() {.noconv.} =
-  # Setze das globale Flag
-  shuttingDown = true
-  # Direkter Echo ohne Lock, da wir im Signal Handler sind
-  echo ""
-  echo "🛑 " & (if config.language == langDE: "Abbruch..." else: "Aborting...")
+  # Nur das Flag setzen, KEIN echo (I/O) im Signal-Handler!
+  shuttingDown.store(true)
 
 proc isSystemPage(pageName: string): bool =
   for prefix in SystemPrefixes:
@@ -102,6 +114,12 @@ proc saveConfig() =
     "language": $config.language
   }
   writeFile(configFile, data.pretty())
+  
+  # Dateiberechtigungen auf 600 setzen (User Read/Write)
+  try:
+    setFilePermissions(configFile, {fpUserRead, fpUserWrite})
+  except CatchableError:
+    discard
 
 # --- CONFIG FUNCTIONS ---
 
@@ -163,7 +181,6 @@ proc createClient(): HttpClient =
   if config.authToken != "":
     result.headers["Authorization"] = "Bearer " & config.authToken
 
-# Retry Logik für allgemeine Requests
 proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, body = ""): string =
   let url = config.serverUrl & endpoint
   var attempts = 0
@@ -183,11 +200,9 @@ proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, b
       else:
         raise newException(ValueError, "Unsupported HTTP method")
       
-      # 404 ist kein Retry-Grund, sondern ein valides Ergebnis (z.B. bei Edit Check)
       if response.code == Http404: return "" 
 
       if response.code != Http200 and response.code != Http201 and response.code != Http204:
-        # Server Fehler (5xx) könnten man retrien, hier brechen wir aber ab für Klarheit
         styledEcho(fgRed, "✗ HTTP Error: ", resetStyle, $response.code, " ", response.status)
         if response.body.len > 0:
           echo "Response body: ", response.body[0..min(response.body.len-1, 500)]
@@ -196,48 +211,42 @@ proc makeRequest(client: HttpClient, httpMethod: HttpMethod, endpoint: string, b
       return response.body
 
     except HttpRequestError, OSError:
-      # Hier greift der Retry bei Netzwerkfehlern (Timeout, Connection refused)
       attempts.inc
       if attempts > MaxRetries:
-        # Finaler Fehler
         raise
-      
-      # Exponential Backoff: 500ms, 1000ms, 1500ms...
       let waitTime = RetryDelayMs * attempts
       styledEcho(fgYellow, "⚠ Network error, retrying in ", $waitTime, "ms...", resetStyle)
       sleep(waitTime)
     except Exception as e:
-      # Andere Fehler sofort werfen
       styledEcho(fgRed, "✗ Error: ", resetStyle, e.msg)
       quit(1)
 
-# --- WORKER PROCS (With Retry & Shutdown Check) ---
+# --- WORKER PROCS (Native Threads) ---
 
 proc distributeWork[T](data: seq[T], chunks: int): seq[seq[T]] =
   result = newSeq[seq[T]](chunks)
   for i, item in data:
     result[i mod chunks].add(item)
 
-proc backupChunk(files: seq[string], backupPath: string, conf: Config, verbose: bool) {.thread.} =
+proc backupChunk(args: BackupArgs) {.thread.} =
   let client = newHttpClient(timeout = HttpTimeoutMs)
   client.headers = newHttpHeaders({"X-Sync-Mode": "true", "Accept": "application/json"})
-  if conf.authToken != "":
-    client.headers["Authorization"] = "Bearer " & conf.authToken
+  if args.conf.authToken != "":
+    client.headers["Authorization"] = "Bearer " & args.conf.authToken
   defer: client.close()
 
-  for name in files:
-    # Graceful Shutdown Check
-    if shuttingDown: return
+  for name in args.files:
+    if shuttingDown.load(): return
 
     let pageName = name[0..^4]
     var attempts = 0
     
     while true:
       try:
-        let url = conf.serverUrl & "/.fs/" & encodeUrl(pageName) & ".md"
+        let url = args.conf.serverUrl & "/.fs/" & encodeUrl(pageName) & ".md"
         let content = client.getContent(url) 
         
-        let filePath = backupPath / name
+        let filePath = args.backupPath / name
         let dir = parentDir(filePath)
         if dir != "" and not dirExists(dir):
           createDir(dir)
@@ -246,81 +255,77 @@ proc backupChunk(files: seq[string], backupPath: string, conf: Config, verbose: 
         
         withLock progressLock:
           processedCount.inc
-          if not verbose and not shuttingDown:
+          if not args.verbose and not shuttingDown.load():
             showProgress(processedCount, globalTotal, "Backup")
         
-        if verbose:
+        if args.verbose:
           withLock consoleLock:
             echo "✓ ", name
         
-        # Erfolg -> Raus aus der while Schleife
         break 
 
       except CatchableError as e:
         attempts.inc
-        if attempts > MaxRetries or shuttingDown:
-          # Nach 3 Versuchen oder bei Shutdown aufgeben
+        if attempts > MaxRetries or shuttingDown.load():
           withLock consoleLock:
-            if not verbose: echo "" 
+            if not args.verbose: echo "" 
             styledEcho(fgRed, "✗ ", resetStyle, name, " (", e.msg, ")")
           break
         else:
-          # Warten und erneut versuchen
           sleep(RetryDelayMs * attempts)
-          if verbose:
+          if args.verbose:
              withLock consoleLock:
-               echo t("retrying", $attempts, $MaxRetries, name)
+               echo i18n.translate("retrying", $args.conf.language, $attempts, $MaxRetries, name)
 
-proc restoreChunk(files: seq[string], sourceDir: string, targetPrefix: string, conf: Config, verbose: bool) {.thread.} =
+proc restoreChunk(args: RestoreArgs) {.thread.} =
   let client = newHttpClient(timeout = HttpTimeoutMs)
   client.headers = newHttpHeaders({"X-Sync-Mode": "true"})
-  if conf.authToken != "":
-    client.headers["Authorization"] = "Bearer " & conf.authToken
+  if args.conf.authToken != "":
+    client.headers["Authorization"] = "Bearer " & args.conf.authToken
   defer: client.close()
 
-  for file in files:
-    # Graceful Shutdown Check
-    if shuttingDown: return
+  for file in args.files:
+    if shuttingDown.load(): return
 
     var attempts = 0
     while true:
       try:
         let content = readFile(file)
-        let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
+        let relPath = file.replace(args.sourceDir, "").strip(chars = {'/', '\\'})
         var pageName = relPath[0..^4].replace("\\", "/")
         
-        if targetPrefix != "":
-          pageName = targetPrefix & "/" & pageName
+        if args.targetPrefix != "":
+          pageName = args.targetPrefix & "/" & pageName
         
-        let url = conf.serverUrl & "/.fs/" & encodeUrl(pageName) & ".md"
+        let url = args.conf.serverUrl & "/.fs/" & encodeUrl(pageName) & ".md"
         
         client.headers["Content-Type"] = "text/markdown"
         discard client.putContent(url, content)
         
         withLock progressLock:
           processedCount.inc
-          if not verbose and not shuttingDown:
+          if not args.verbose and not shuttingDown.load():
             showProgress(processedCount, globalTotal, "Restore")
         
-        if verbose:
+        if args.verbose:
           withLock consoleLock:
             echo "✓ ", pageName
         
-        break # Erfolg
+        break 
 
       except CatchableError as e:
         attempts.inc
-        let relPath = file.replace(sourceDir, "").strip(chars = {'/', '\\'})
-        if attempts > MaxRetries or shuttingDown:
+        let relPath = file.replace(args.sourceDir, "").strip(chars = {'/', '\\'})
+        if attempts > MaxRetries or shuttingDown.load():
           withLock consoleLock:
-            if not verbose: echo ""
+            if not args.verbose: echo ""
             styledEcho(fgRed, "✗ ", resetStyle, relPath, " (", e.msg, ")")
           break
         else:
           sleep(RetryDelayMs * attempts)
-          if verbose:
+          if args.verbose:
              withLock consoleLock:
-               echo t("retrying", $attempts, $MaxRetries, relPath)
+               echo i18n.translate("retrying", $args.conf.language, $attempts, $MaxRetries, relPath)
 
 # --- STANDARD COMMANDS ---
 
@@ -412,7 +417,6 @@ proc searchPages(client: HttpClient, query: string) =
           styledEcho(fgCyan, "• ", resetStyle, pageName, " ", fgYellow, t("in_title"))
           continue
         
-        # Fuzzy Suche
         let dist = editDistance(query.toLower(), pageName.toLower())
         let threshold = if query.len < 4: 1 else: 3
         if dist <= threshold:
@@ -430,7 +434,7 @@ proc searchPages(client: HttpClient, query: string) =
                 let trimmed = line.strip()
                 if trimmed.len > 0:
                   echo "  ", trimmed[0..min(trimmed.len-1, MaxSnippetLength)]
-                break
+            break
         except HttpRequestError, OSError:
           discard
   echo "─".repeat(SeparatorLength)
@@ -485,19 +489,36 @@ proc backupPages(client: HttpClient, targetDir = "", fullBackup = false, verbose
   processedCount = 0
   echo "─".repeat(SeparatorLength)
   echo t("total"), ": ", globalTotal, " ", t("files")
+  
   if globalTotal == 0:
     echo "Nichts zu tun."
     return
+  
   let numThreads = countProcessors()
   let chunks = distributeWork(filesToBackup, numThreads)
+  
+  # 1. Zähle genau, wie viele Threads wir wirklich brauchen
+  var activeChunks = 0
+  for chunk in chunks:
+    if chunk.len > 0: activeChunks.inc
+  
+  # 2. Erstelle die Seq in exakt dieser Größe
+  var threads = newSeq[Thread[BackupArgs]](activeChunks)
+  var threadIdx = 0
+  
   for chunk in chunks:
     if chunk.len > 0:
-      spawn backupChunk(chunk, backupPath, config, verbose)
-  sync()
+      createThread(threads[threadIdx], backupChunk, (chunk, backupPath, config, verbose))
+      threadIdx.inc
+      
+  # 3. Warte auf alle Threads (ohne Slicing/Kopieren!)
+  if threads.len > 0:
+    joinThreads(threads)
+
   echo ""
   echo "─".repeat(SeparatorLength)
-  if shuttingDown:
-    styledEcho(fgYellow, "⚠ ", t("operation_aborted"), resetStyle)
+  if shuttingDown.load():
+    styledEcho(fgYellow, "🛑 ", t("operation_aborted"), resetStyle)
   else:
     styledEcho(fgGreen, "✓ ", resetStyle, t("backup_success", backupPath))
 
@@ -514,18 +535,35 @@ proc restorePages(client: HttpClient, sourceDir: string, targetPrefix = "", verb
   processedCount = 0
   echo "─".repeat(SeparatorLength)
   echo t("total"), ": ", globalTotal, " ", t("files")
+  
   if globalTotal == 0:
     return
+  
   let numThreads = countProcessors()
   let chunks = distributeWork(filesToRestore, numThreads)
+  
+  # 1. Zähle genau, wie viele Threads wir wirklich brauchen
+  var activeChunks = 0
+  for chunk in chunks:
+    if chunk.len > 0: activeChunks.inc
+  
+  # 2. Erstelle die Seq in exakt dieser Größe
+  var threads = newSeq[Thread[RestoreArgs]](activeChunks)
+  var threadIdx = 0
+  
   for chunk in chunks:
     if chunk.len > 0:
-      spawn restoreChunk(chunk, sourceDir, targetPrefix, config, verbose)
-  sync()
+      createThread(threads[threadIdx], restoreChunk, (chunk, sourceDir, targetPrefix, config, verbose))
+      threadIdx.inc
+      
+  # 3. Warte auf alle Threads (ohne Slicing/Kopieren!)
+  if threads.len > 0:
+    joinThreads(threads)
+
   echo ""
   echo "─".repeat(SeparatorLength)
-  if shuttingDown:
-    styledEcho(fgYellow, "⚠ ", t("operation_aborted"), resetStyle)
+  if shuttingDown.load():
+    styledEcho(fgYellow, "🛑 ", t("operation_aborted"), resetStyle)
   else:
     styledEcho(fgGreen, "✓ ", resetStyle, t("restore_success"))
 
@@ -565,9 +603,7 @@ proc uploadPage(client: HttpClient, sourceFile: string, pageName: string) =
     quit(1)
   try:
     let content = readFile(sourceFile)
-    
     let cleanPageName = pageName.replace('\\', '/')
-    
     discard makeRequest(client, HttpPut, getPageEndpoint(cleanPageName), content)
     
     styledEcho(fgGreen, "✓ ", resetStyle, t("uploaded"), ": ", sourceFile)
@@ -582,7 +618,13 @@ proc extractLinks(content: string): seq[string] =
   let pattern = re"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]"
   for match in content.findAll(pattern):
     let inner = match[2..^3]
-    let linkName = if "|" in inner: inner.split("|")[0].strip() else: inner.strip()
+    var linkName = if "|" in inner: inner.split("|")[0].strip() else: inner.strip()
+    
+    # Anker-Links abschneiden
+    let hashPos = linkName.find('#')
+    if hashPos >= 0:
+      linkName = linkName[0 ..< hashPos].strip()
+      
     if linkName != "":
       links.add(linkName)
   return links
@@ -695,7 +737,7 @@ proc openEditor(client: HttpClient, pageName: string) =
     let url = config.serverUrl & getPageEndpoint(pageName)
     let resp = client.get(url)
     if resp.code == Http404:
-      styledEcho(fgYellow, "ℹ ", t("new_draft_msg"), resetStyle)
+       styledEcho(fgYellow, "ℹ ", t("new_draft_msg"), resetStyle)
     elif resp.code == Http200:
       currentContent = resp.body
     else:
@@ -712,6 +754,11 @@ proc openEditor(client: HttpClient, pageName: string) =
   let tempFile = tempDir / ("sb_edit_" & pageName.replace("/", "_") & ".md")
   writeFile(tempFile, currentContent)
   
+  # Garantiert das Löschen der Datei beim Verlassen der Funktion
+  defer: 
+    if fileExists(tempFile):
+      removeFile(tempFile)
+  
   var editor = getEnv("EDITOR")
   if editor == "":
     when defined(windows): editor = "notepad"
@@ -725,7 +772,6 @@ proc openEditor(client: HttpClient, pageName: string) =
     return
 
   let newContent = readFile(tempFile)
-  removeFile(tempFile)
 
   if newContent == currentContent:
     echo "🤔 ", t("no_changes")
@@ -853,14 +899,14 @@ proc main() =
       else: echo t("unknown_option", key)
     of cmdEnd: assert(false)
 
-  configFile = opts.configFile; loadConfig()
+  configFile = opts.configFile
+  loadConfig()
   
   if opts.command == "":
     echo AppName, " v", Version
     echo "Use 'sb help' for commands."
     return
 
-  # Fall 2: Befehl ist explizit 'help' -> Zeige die volle Hilfe
   if opts.command in ["help", "h"]:
     showHelp()
     return
@@ -870,12 +916,14 @@ proc main() =
   if opts.command == "config":
     if opts.args.len < 1: echo t("error_url_required"); return
     configureServer(opts.args[0], if opts.args.len >= 2: opts.args[1] else: ""); return
+  
   if opts.command in ["lang", "language"]:
     if opts.args.len < 1: echo "Error: Language required"; return
     setLanguage(opts.args[0]); return
 
   if config.serverUrl == "":
       styledEcho(fgRed, "✗ ", resetStyle, t("error_no_url")); quit(1)
+  
   let client = createClient(); defer: client.close()
 
   case opts.command
@@ -934,10 +982,13 @@ proc main() =
     showGraph(client, if opts.args.len >= 1: opts.args[0] else: "text", opts.showAll)
   else:
     echo t("error_unknown_command"), ": ", opts.command
-    var bestMatch = ""; var bestDist = 100
+    var bestMatch = ""
+    var bestDist = 100
     for valid in ValidCommands:
       let dist = editDistance(opts.command, valid)
-      if dist < bestDist: bestDist = dist; bestMatch = valid
+      if dist < bestDist: 
+        bestDist = dist
+        bestMatch = valid
     if bestDist <= 2:
       let msg = if config.language == langDE: "Meintest du '$1'?" else: "Did you mean '$1'?"
       styledEcho(fgYellow, "💡 ", msg % bestMatch, resetStyle)
